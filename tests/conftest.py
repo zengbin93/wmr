@@ -48,7 +48,8 @@ def clickhouse_dsn() -> Iterator[str]:
     image = os.getenv("WMR_TEST_CLICKHOUSE_IMAGE", "clickhouse/clickhouse-server:24.8")
     with ClickHouseContainer(image) as ch:
         host = ch.get_container_host_ip()
-        port = ch.get_exposed_port(9000)
+        # clickhouse-connect 走 HTTP 协议(8123),9000 是 native client 端口
+        port = ch.get_exposed_port(8123)
         user = ch.username
         password = ch.password
         dsn = f"clickhouse://{user}:{password}@{host}:{port}"
