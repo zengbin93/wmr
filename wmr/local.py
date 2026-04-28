@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -39,8 +40,10 @@ from wmr.utils import (
     DEFAULT_TZ,
     _ensure_series_tz,
     _localize_dataframe_columns,
+    _resolve_verbose,
     _series_to_naive,
     _to_naive,
+    _truncate_seq,
 )
 
 # `_to_naive` / `_series_to_naive` 已移至 ``wmr.utils``,此处仅以 re-export 形式
@@ -69,6 +72,8 @@ class LocalManager(BaseManager):
         read_only: bool = False,
         logger: Any = loguru.logger,
         tz: ZoneInfo = DEFAULT_TZ,
+        *,
+        verbose: bool | None = None,
     ) -> None:
         """初始化 LocalManager。
 
@@ -78,6 +83,10 @@ class LocalManager(BaseManager):
             read_only: 是否以只读模式打开,默认 False。
             logger: 日志器,默认 loguru.logger。
             tz: 时区,默认 ``Asia/Shanghai``。
+            verbose: 是否输出详细执行过程日志(连接、SQL 摘要、批次进度等)。
+                ``None``(默认)时读取环境变量 ``WMR_VERBOSE``,识别
+                ``1`` / ``true`` / ``yes`` / ``on`` 为真,其它一律 ``False``。
+                详见 ``docs/verbose-mode.md``。
         """
         if db_path is None:
             db_path = DEFAULT_LOCAL_DB_PATH
@@ -87,18 +96,22 @@ class LocalManager(BaseManager):
         self._read_only: bool = read_only
         self._logger = logger
         self._tz: ZoneInfo = tz
+        self._verbose: bool = _resolve_verbose(verbose)
         self._conn: duckdb.DuckDBPyConnection | None = None
+        self._vlog(f"LocalManager 创建: db_path={self._db_path}, read_only={self._read_only}, tz={tz}")
 
     # ---------- 生命周期 ----------
     def connect(self) -> duckdb.DuckDBPyConnection:
         """建立或复用 DuckDB 连接。"""
         if self._conn is None:
+            self._vlog(f"打开 DuckDB 连接: {self._db_path} (read_only={self._read_only})")
             self._conn = duckdb.connect(self._db_path, read_only=self._read_only)
         return self._conn
 
     def close(self) -> None:
         """关闭 DuckDB 连接。重复调用安全。"""
         if self._conn is not None:
+            self._vlog(f"关闭 DuckDB 连接: {self._db_path}")
             self._conn.close()
             self._conn = None
 
@@ -110,58 +123,66 @@ class LocalManager(BaseManager):
     def initialize(self) -> None:
         """创建 4 张表与 3 个视图。允许重复调用。"""
         c = self.conn
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS metas (
-                strategy VARCHAR PRIMARY KEY,
-                base_freq VARCHAR,
-                description VARCHAR,
-                author VARCHAR,
-                outsample_sdt TIMESTAMP,
-                create_time TIMESTAMP,
-                update_time TIMESTAMP,
-                heartbeat_time TIMESTAMP,
-                weight_type VARCHAR,
-                status VARCHAR DEFAULT '实盘',
-                memo VARCHAR
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS weights (
-                dt TIMESTAMP,
-                symbol VARCHAR,
-                weight DOUBLE,
-                strategy VARCHAR,
-                update_time TIMESTAMP,
-                PRIMARY KEY (strategy, dt, symbol)
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS returns (
-                dt TIMESTAMP,
-                symbol VARCHAR,
-                returns DOUBLE,
-                strategy VARCHAR,
-                update_time TIMESTAMP,
-                PRIMARY KEY (strategy, dt, symbol)
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tags (
-                strategy VARCHAR,
-                tag VARCHAR,
-                creator VARCHAR DEFAULT 'system',
-                create_time TIMESTAMP,
-                PRIMARY KEY (strategy, tag)
-            )
-            """
-        )
+        for table_name, ddl in (
+            (
+                "metas",
+                """
+                CREATE TABLE IF NOT EXISTS metas (
+                    strategy VARCHAR PRIMARY KEY,
+                    base_freq VARCHAR,
+                    description VARCHAR,
+                    author VARCHAR,
+                    outsample_sdt TIMESTAMP,
+                    create_time TIMESTAMP,
+                    update_time TIMESTAMP,
+                    heartbeat_time TIMESTAMP,
+                    weight_type VARCHAR,
+                    status VARCHAR DEFAULT '实盘',
+                    memo VARCHAR
+                )
+                """,
+            ),
+            (
+                "weights",
+                """
+                CREATE TABLE IF NOT EXISTS weights (
+                    dt TIMESTAMP,
+                    symbol VARCHAR,
+                    weight DOUBLE,
+                    strategy VARCHAR,
+                    update_time TIMESTAMP,
+                    PRIMARY KEY (strategy, dt, symbol)
+                )
+                """,
+            ),
+            (
+                "returns",
+                """
+                CREATE TABLE IF NOT EXISTS returns (
+                    dt TIMESTAMP,
+                    symbol VARCHAR,
+                    returns DOUBLE,
+                    strategy VARCHAR,
+                    update_time TIMESTAMP,
+                    PRIMARY KEY (strategy, dt, symbol)
+                )
+                """,
+            ),
+            (
+                "tags",
+                """
+                CREATE TABLE IF NOT EXISTS tags (
+                    strategy VARCHAR,
+                    tag VARCHAR,
+                    creator VARCHAR DEFAULT 'system',
+                    create_time TIMESTAMP,
+                    PRIMARY KEY (strategy, tag)
+                )
+                """,
+            ),
+        ):
+            c.execute(ddl)
+            self._vlog(f"创建/复用表: {table_name}")
         c.execute(
             """
             CREATE OR REPLACE VIEW cs_latest_weights AS
@@ -175,6 +196,7 @@ class LocalManager(BaseManager):
             WHERE m.weight_type = 'cs'
             """
         )
+        self._vlog("创建/复用视图: cs_latest_weights")
         c.execute(
             """
             CREATE OR REPLACE VIEW ts_latest_weights AS
@@ -190,6 +212,7 @@ class LocalManager(BaseManager):
             WHERE m.weight_type = 'ts'
             """
         )
+        self._vlog("创建/复用视图: ts_latest_weights")
         c.execute(
             """
             CREATE OR REPLACE VIEW latest_weights AS
@@ -198,6 +221,7 @@ class LocalManager(BaseManager):
             SELECT * FROM cs_latest_weights
             """
         )
+        self._vlog("创建/复用视图: latest_weights")
         self._logger.info(f"LocalManager initialize 完成,db_path={self._db_path}")
 
     # ---------- metas ----------
@@ -222,6 +246,7 @@ class LocalManager(BaseManager):
                 ["outsample_sdt", "create_time", "update_time", "heartbeat_time"],
                 tz=self._tz,
             )
+        self._vlog(f"get_all_metas → {len(df)} 条")
         return df
 
     def set_meta(
@@ -236,6 +261,7 @@ class LocalManager(BaseManager):
         memo: str = "",
         overwrite: bool = False,
     ) -> None:
+        self._vlog(f"set_meta(strategy={strategy}, weight_type={weight_type}, status={status}, overwrite={overwrite})")
         meta = self.get_meta(strategy)
         if meta and not overwrite:
             self._logger.warning(f"策略 {strategy} 已存在元数据,如需更新请设置 overwrite=True")
@@ -295,12 +321,15 @@ class LocalManager(BaseManager):
                 ["outsample_sdt", "create_time", "update_time", "heartbeat_time"],
                 tz=self._tz,
             )
+        self._vlog(f"get_strategies_by_status(status={status!r}) → {len(df)} 条")
         return df
 
     # ---------- weights ----------
     def publish_weights(self, strategy: str, df: pd.DataFrame, batch_size: int = 100000) -> None:
+        self._log_publish_entry(strategy, df, table="weights")
+        t0 = time.perf_counter()
         self.heartbeat(strategy)
-        self._publish_dataframe(
+        n = self._publish_dataframe(
             strategy,
             df,
             table="weights",
@@ -309,6 +338,9 @@ class LocalManager(BaseManager):
             batch_size=batch_size,
         )
         self.heartbeat(strategy)
+        self._logger.info(
+            f"完成 publish_weights(strategy={strategy}, 实际写入 {n} 条, 耗时 {time.perf_counter() - t0:.2f}s)"
+        )
 
     def get_strategy_weights(
         self,
@@ -339,6 +371,10 @@ class LocalManager(BaseManager):
         if not df.empty:
             df = _localize_dataframe_columns(df, ["dt", "update_time"], tz=self._tz)
             df = df.sort_values(["dt", "symbol"]).reset_index(drop=True)
+        self._vlog(
+            f"get_strategy_weights(strategy={strategy}, sdt={sdt}, edt={edt}, "
+            f"symbols={_truncate_seq(symbols)}) → {len(df)} 行"
+        )
         return df
 
     def get_latest_weights(self, strategy: str | None = None) -> pd.DataFrame:
@@ -349,17 +385,40 @@ class LocalManager(BaseManager):
         if not df.empty:
             df = _localize_dataframe_columns(df, ["dt", "update_time"], tz=self._tz)
             df = df.sort_values(["strategy", "dt", "symbol"]).reset_index(drop=True)
+        self._vlog(f"get_latest_weights(strategy={strategy or 'ALL'}) → {len(df)} 行")
         return df
 
     # ---------- returns ----------
     def publish_returns(self, strategy: str, df: pd.DataFrame, batch_size: int = 100000) -> None:
-        self._publish_dataframe(
+        self._log_publish_entry(strategy, df, table="returns")
+        t0 = time.perf_counter()
+        n = self._publish_dataframe(
             strategy,
             df,
             table="returns",
             value_col="returns",
             mode="upsert",
             batch_size=batch_size,
+        )
+        self._logger.info(
+            f"完成 publish_returns(strategy={strategy}, 实际写入 {n} 条, 耗时 {time.perf_counter() - t0:.2f}s)"
+        )
+
+    # ---------- 公共出入口辅助 ----------
+    def _log_publish_entry(self, strategy: str, df: pd.DataFrame, *, table: str) -> None:
+        """publish_weights / publish_returns 共享的入口 INFO 日志(event 档)。
+
+        缺列时不在此处兜底 —— 后续 ``_publish_dataframe`` 会以更清晰的 ``KeyError``
+        定位具体缺哪一列。
+        """
+        if df.empty:
+            n_symbols, dt_lo, dt_hi = 0, "N/A", "N/A"
+        else:
+            n_symbols = int(df["symbol"].nunique())
+            dt_lo, dt_hi = df["dt"].min(), df["dt"].max()
+        self._logger.info(
+            f"开始 publish_{table}(strategy={strategy}, 输入 {len(df)} 行, "
+            f"{n_symbols} 个 symbol, dt ∈ [{dt_lo}, {dt_hi}])"
         )
 
     # ---------- publish 流水线钩子 ----------
@@ -412,10 +471,15 @@ class LocalManager(BaseManager):
         if not df.empty:
             df = _localize_dataframe_columns(df, ["dt", "update_time"], tz=self._tz)
             df = df.sort_values(["dt", "symbol"]).reset_index(drop=True)
+        self._vlog(
+            f"get_strategy_returns(strategy={strategy}, sdt={sdt}, edt={edt}, "
+            f"symbols={_truncate_seq(symbols)}) → {len(df)} 行"
+        )
         return df
 
     # ---------- tags ----------
     def add_tag(self, strategy: str, tag: str, creator: str = "system") -> None:
+        self._vlog(f"add_tag(strategy={strategy}, tag={tag}, creator={creator})")
         now_naive = _to_naive(pd.Timestamp.now(tz=self._tz))
         c = self.conn
         c.execute("DELETE FROM tags WHERE strategy = ? AND tag = ?", [strategy, tag])
@@ -428,6 +492,7 @@ class LocalManager(BaseManager):
         rows = list(items)
         if not rows:
             return 0
+        self._vlog(f"add_tags: 输入 {len(rows)} 条, batch_size={batch_size}")
         now_naive = _to_naive(pd.Timestamp.now(tz=self._tz))
         c = self.conn
         n = 0
@@ -440,6 +505,8 @@ class LocalManager(BaseManager):
                     [strategy, tag, "system", now_naive],
                 )
                 n += 1
+            self._vlog(f"add_tags 批次 {i // batch_size + 1}: 写入 {len(batch)} 条")
+        self._vlog(f"add_tags 完成: 处理 {n} 条")
         return n
 
     def list_tags(self, strategy: str | None = None, tag: str | None = None) -> pd.DataFrame:
@@ -458,9 +525,11 @@ class LocalManager(BaseManager):
         if not df.empty:
             df = _localize_dataframe_columns(df, ["create_time"], tz=self._tz)
             df = df.sort_values(["strategy", "tag"]).reset_index(drop=True)
+        self._vlog(f"list_tags(strategy={strategy}, tag={tag}) → {len(df)} 行")
         return df
 
     def remove_tag(self, strategy: str, tag: str) -> None:
+        self._vlog(f"remove_tag(strategy={strategy}, tag={tag})")
         self.conn.execute("DELETE FROM tags WHERE strategy = ? AND tag = ?", [strategy, tag])
 
     # ---------- 心跳与运维 ----------
@@ -474,6 +543,7 @@ class LocalManager(BaseManager):
             "UPDATE metas SET heartbeat_time = ? WHERE strategy = ?",
             [now_naive, strategy],
         )
+        self._vlog(f"heartbeat({strategy}) ok")
 
     def clear_strategy(self, strategy: str, human_confirm: bool = True) -> None:
         meta = self.get_meta(strategy)
@@ -495,29 +565,30 @@ class LocalManager(BaseManager):
         weights_count = int(row[0]) if row else 0
         returns_count = int(row[1]) if row else 0
         tags_count = int(row[2]) if row else 0
-        self._logger.info(f"策略 {strategy} 数据概况:")
-        self._logger.info(f"  - 策略状态: {meta.get('status', '未知')}")
-        self._logger.info(f"  - 创建时间: {meta.get('create_time', '未知')}")
-        self._logger.info(f"  - 最后更新: {meta.get('update_time', '未知')}")
-        self._logger.info(f"  - 权重数据: {weights_count:,} 条")
-        self._logger.info(f"  - 收益数据: {returns_count:,} 条")
-        self._logger.info(f"  - 标签数据: {tags_count:,} 条")
+        self._logger.info(
+            f"策略 {strategy} 即将清空: status={meta.get('status', '未知')}, "
+            f"weights={weights_count:,}, returns={returns_count:,}, tags={tags_count:,}"
+        )
+        self._vlog(
+            f"  详情: create_time={meta.get('create_time', '未知')}, update_time={meta.get('update_time', '未知')}"
+        )
 
         if human_confirm:
-            self._logger.info("=" * 60)
-            self._logger.info(f"⚠️  警告:即将删除策略 {strategy} 的所有数据")
-            self._logger.info("=" * 60)
-            confirm = input("请仔细确认上述信息,确认删除请输入 'DELETE' (大小写敏感): ")
+            self._logger.warning(f"⚠️  即将删除策略 {strategy} 的所有数据,输入 'DELETE' 确认:")
+            confirm = input("> ")
             if confirm != "DELETE":
                 self._logger.warning(f"取消清空策略 {strategy} 的所有数据")
                 return
-            self._logger.info("开始执行删除操作...")
 
+        t0 = time.perf_counter()
         c.execute("DELETE FROM metas WHERE strategy = ?", [strategy])
         c.execute("DELETE FROM weights WHERE strategy = ?", [strategy])
         c.execute("DELETE FROM returns WHERE strategy = ?", [strategy])
         c.execute("DELETE FROM tags WHERE strategy = ?", [strategy])
-        self._logger.warning(f"策略 {strategy} 清空完成")
+        self._logger.info(
+            f"策略 {strategy} 清空完成: weights={weights_count:,}, returns={returns_count:,}, "
+            f"tags={tags_count:,}, metas=1, 耗时 {time.perf_counter() - t0:.2f}s"
+        )
 
     def summary(self) -> dict:
         # 一条 SQL 拿全部 5 个计数,与 OnlineManager.summary 保持对称
@@ -531,15 +602,17 @@ class LocalManager(BaseManager):
                 (SELECT count(DISTINCT strategy) FROM metas) AS strategies
             """
         ).fetchone()
-        if row is None:
-            return {"metas": 0, "weights": 0, "returns": 0, "tags": 0, "strategies": 0}
-        return {
+        # 多个 (SELECT count) 子查询恒返回一行,row 不会是 None;assert 给 typecheck 收窄。
+        assert row is not None
+        result = {
             "metas": int(row[0]),
             "weights": int(row[1]),
             "returns": int(row[2]),
             "tags": int(row[3]),
             "strategies": int(row[4]),
         }
+        self._vlog(f"summary → {result}")
+        return result
 
     def _scalar(self, sql: str, params: list[Any] | None = None) -> Any:
         """执行返回单值的 SQL,空结果返回 0。"""
@@ -568,4 +641,4 @@ class LocalManager(BaseManager):
             c.unregister("__tmp_df")
 
     def __repr__(self) -> str:
-        return f"LocalManager(db_path={self._db_path!r}, read_only={self._read_only})"
+        return f"LocalManager(db_path={self._db_path!r}, read_only={self._read_only}, verbose={self._verbose})"

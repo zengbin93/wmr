@@ -52,6 +52,30 @@ class BaseManager(ABC):
     # 子类构造函数必须设置以下属性,模板方法 ``_publish_dataframe`` 会读取它们。
     _logger: Any
     _tz: ZoneInfo
+    _verbose: bool
+
+    # ---------- verbose 日志路由 ----------
+    def _vlog(self, msg: str, *, level: str = "INFO") -> None:
+        """详细日志 — verbose 模式下按 ``level`` 输出,默认降级到 DEBUG。
+
+        用于"过程细节"型日志(批次进度、过滤前后行数、SQL 摘要、连接细节)。
+        非 verbose 时仍以 DEBUG 留痕,方便调用方临时把 sink level 调低取全量。
+        """
+        if self._verbose:
+            self._logger.log(level, msg)
+        else:
+            self._logger.debug(msg)
+
+    def _vexc(self, msg: str) -> None:
+        """详细异常 — verbose 模式下附 traceback,否则只 ERROR 一行。
+
+        必须在 ``except`` 块中调用(loguru 的 ``logger.exception`` 从当前异常上下文
+        取 traceback;不在 except 中调用会得到空 traceback)。
+        """
+        if self._verbose:
+            self._logger.exception(msg)
+        else:
+            self._logger.error(msg)
 
     # ---------- 生命周期 ----------
     @abstractmethod
@@ -345,7 +369,7 @@ class BaseManager(ABC):
         value_col: str,
         mode: Literal["append", "upsert"],
         batch_size: int,
-    ) -> None:
+    ) -> int:
         """`publish_weights` / `publish_returns` 共享流水线。
 
         4 步标准化流程:
@@ -355,6 +379,9 @@ class BaseManager(ABC):
         3. 排序、去重、float 化、加 ``update_time``
         4. ``batch_size`` 分批调用 ``_insert_publish_batch``
 
+        中间过程(过滤前后行数、批次进度)走 ``_vlog``,默认对调用方不可见;
+        外层 ``publish_weights`` / ``publish_returns`` 负责入口/出口的 INFO 日志。
+
         Args:
             strategy: 策略名。
             df: 输入 DataFrame,必含 ``dt`` / ``symbol`` / ``<value_col>`` 三列。
@@ -362,6 +389,9 @@ class BaseManager(ABC):
             value_col: 业务值列名(``weight`` / ``returns``)。
             mode: ``append`` = 仅追加;``upsert`` = 允许覆盖同日。
             batch_size: 分批大小。
+
+        Returns:
+            实际写入行数(过滤 + 去重后)。
         """
         # ---------- 1. 标准化输入 ----------
         df = df[["dt", "symbol", value_col]].copy()
@@ -372,7 +402,7 @@ class BaseManager(ABC):
         symbol_dt = self._query_symbol_latest_dt(strategy, table)
         if symbol_dt:
             cmp = operator.gt if mode == "append" else operator.ge
-            self._logger.info(f"策略 {strategy} 最新时间:{max(symbol_dt.values())}")
+            self._vlog(f"策略 {strategy} {table} 历史最新时间:{max(symbol_dt.values())}")
             rows: list[pd.DataFrame] = []
             for symbol, dfg in df.groupby("symbol"):
                 latest_dt = symbol_dt.get(str(symbol))
@@ -381,7 +411,9 @@ class BaseManager(ABC):
                 rows.append(dfg)
             if rows:
                 df = pd.concat(rows, ignore_index=True)
-            self._logger.info(f"策略 {strategy} 共 {len(df)} 条新数据")
+            self._vlog(f"策略 {strategy} 过滤后剩余 {len(df)} 条 {table}")
+        else:
+            self._vlog(f"策略 {strategy} 无 {table} 历史数据,全量写入")
 
         # ---------- 3. 排序 + 去重 + 加 update_time ----------
         df = df.sort_values(["dt", "symbol"]).reset_index(drop=True)
@@ -391,8 +423,9 @@ class BaseManager(ABC):
         df[value_col] = df[value_col].astype(float)
 
         # ---------- 4. 分批写入 ----------
-        for i in range(0, len(df), batch_size):
+        total = len(df)
+        for i in range(0, total, batch_size):
             batch = df.iloc[i : i + batch_size]
             self._insert_publish_batch(table, batch)
-            self._logger.info(f"完成批次 {i // batch_size + 1},发布 {len(batch)} 条 {table}")
-        self._logger.info(f"完成所有 {table} 发布,共 {len(df)} 条")
+            self._vlog(f"批次 {i // batch_size + 1}: 写入 {len(batch)} 条 {table}")
+        return total

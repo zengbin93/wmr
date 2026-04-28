@@ -10,7 +10,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import os
+from collections.abc import Iterable, Sequence
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 from zoneinfo import ZoneInfo
@@ -19,6 +20,39 @@ import pandas as pd
 from pandas._libs.tslibs.nattype import NaTType
 
 DEFAULT_TZ = ZoneInfo("Asia/Shanghai")
+
+_VERBOSE_TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
+
+
+def _resolve_verbose(explicit: bool | None) -> bool:
+    """解析 verbose 取值:显式参数 > ``WMR_VERBOSE`` 环境变量 > ``False``。
+
+    环境变量中 ``1`` / ``true`` / ``yes`` / ``on``(大小写不敏感)视作真,其它一律假。
+    """
+    if explicit is not None:
+        return bool(explicit)
+    raw = os.environ.get("WMR_VERBOSE", "").strip().lower()
+    return raw in _VERBOSE_TRUE_LITERALS
+
+
+def _truncate_seq(seq: Sequence[Any] | None, n: int = 5) -> str:
+    """生成日志友好的列表预览。
+
+    用于 ``symbols`` 等可能很长的入参,避免日志被刷屏:
+
+    - ``None`` → ``"None"``
+    - 元素 ≤ n → ``"[a, b, c]"``
+    - 元素 > n → ``"[a, b, c, ..., 共 N 个]"``
+    """
+    if seq is None:
+        return "None"
+    if isinstance(seq, str):
+        return repr(seq)
+    items = list(seq)
+    if len(items) <= n:
+        return "[" + ", ".join(repr(x) for x in items) + "]"
+    head = ", ".join(repr(x) for x in items[:n])
+    return f"[{head}, ..., 共 {len(items)} 个]"
 
 
 def _ensure_timestamp(value: Any, tz: ZoneInfo = DEFAULT_TZ) -> pd.Timestamp | NaTType:

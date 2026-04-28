@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -42,6 +43,8 @@ from wmr.utils import (
     _ensure_timestamp,
     _format_for_db,
     _localize_dataframe_columns,
+    _resolve_verbose,
+    _truncate_seq,
     mask_dsn_password,
 )
 
@@ -103,6 +106,8 @@ class OnlineManager(BaseManager):
         client_kwargs: dict[str, Any] | None = None,
         logger: Any = loguru.logger,
         tz: ZoneInfo = DEFAULT_TZ,
+        *,
+        verbose: bool | None = None,
     ) -> None:
         """初始化 OnlineManager。
 
@@ -116,6 +121,10 @@ class OnlineManager(BaseManager):
                 如 ``{"connect_timeout": 30, "send_receive_timeout": 60}``。
             logger: 日志器,默认 loguru.logger。
             tz: 时区,默认 ``Asia/Shanghai``。
+            verbose: 是否输出详细执行过程日志(连接、SQL 摘要、批次进度等)。
+                ``None``(默认)时读取环境变量 ``WMR_VERBOSE``,识别
+                ``1`` / ``true`` / ``yes`` / ``on`` 为真,其它一律 ``False``。
+                详见 ``docs/verbose-mode.md``。
 
         Raises:
             ValueError: DSN 缺失或格式非法。
@@ -131,8 +140,13 @@ class OnlineManager(BaseManager):
         self._client_kwargs: dict[str, Any] = client_kwargs or {}
         self._logger = logger
         self._tz: ZoneInfo = tz
+        self._verbose: bool = _resolve_verbose(verbose)
         self._database: str = database or parsed["database"] or DEFAULT_DATABASE
         self._client: Client | None = None
+        self._vlog(
+            f"OnlineManager 创建: host={parsed['host']}:{parsed['port']}, "
+            f"user={parsed['user']}, database={self._database}"
+        )
 
     # ---------- 生命周期 ----------
     def connect(self) -> Client:
@@ -141,6 +155,7 @@ class OnlineManager(BaseManager):
             import clickhouse_connect
 
             p = self._dsn_parts
+            self._vlog(f"连接 ClickHouse: host={p['host']}:{p['port']}, user={p['user']}, database={self._database}")
             self._client = clickhouse_connect.get_client(
                 host=p["host"],
                 port=p["port"],
@@ -153,6 +168,7 @@ class OnlineManager(BaseManager):
     def close(self) -> None:
         """关闭 Client。重复调用安全。"""
         if self._client is not None:
+            self._vlog("关闭 ClickHouse 连接")
             try:
                 self._client.close()
             finally:
@@ -168,6 +184,7 @@ class OnlineManager(BaseManager):
         c = self.client
         db = self._database
         c.command(f"CREATE DATABASE IF NOT EXISTS {db}")
+        self._vlog(f"创建/复用 database: {db}")
 
         c.command(
             f"""
@@ -188,6 +205,7 @@ class OnlineManager(BaseManager):
             ORDER BY strategy
             """
         )
+        self._vlog(f"创建/复用表: {db}.metas")
         c.command(
             f"""
             CREATE TABLE IF NOT EXISTS {db}.weights (
@@ -201,6 +219,7 @@ class OnlineManager(BaseManager):
             ORDER BY (strategy, dt, symbol)
             """
         )
+        self._vlog(f"创建/复用表: {db}.weights")
         c.command(
             f"""
             CREATE TABLE IF NOT EXISTS {db}.returns (
@@ -214,6 +233,7 @@ class OnlineManager(BaseManager):
             ORDER BY (strategy, dt, symbol)
             """
         )
+        self._vlog(f"创建/复用表: {db}.returns")
         c.command(
             f"""
             CREATE TABLE IF NOT EXISTS {db}.tags (
@@ -226,6 +246,7 @@ class OnlineManager(BaseManager):
             ORDER BY (strategy, tag)
             """
         )
+        self._vlog(f"创建/复用表: {db}.tags")
         c.command(
             f"""
             CREATE VIEW IF NOT EXISTS {db}.cs_latest_weights AS
@@ -242,6 +263,7 @@ class OnlineManager(BaseManager):
             WHERE m.weight_type = 'cs'
             """
         )
+        self._vlog(f"创建/复用视图: {db}.cs_latest_weights")
         c.command(
             f"""
             CREATE VIEW IF NOT EXISTS {db}.ts_latest_weights AS
@@ -259,6 +281,7 @@ class OnlineManager(BaseManager):
             WHERE m.weight_type = 'ts'
             """
         )
+        self._vlog(f"创建/复用视图: {db}.ts_latest_weights")
         c.command(
             f"""
             CREATE VIEW IF NOT EXISTS {db}.latest_weights AS
@@ -267,6 +290,7 @@ class OnlineManager(BaseManager):
             SELECT * FROM {db}.cs_latest_weights
             """
         )
+        self._vlog(f"创建/复用视图: {db}.latest_weights")
         self._logger.info(f"OnlineManager initialize 完成,database={db}")
 
     # ---------- metas ----------
@@ -296,6 +320,7 @@ class OnlineManager(BaseManager):
                 ["outsample_sdt", "create_time", "update_time", "heartbeat_time"],
                 tz=self._tz,
             )
+        self._vlog(f"get_all_metas → {len(df)} 条")
         return df
 
     def set_meta(
@@ -310,6 +335,7 @@ class OnlineManager(BaseManager):
         memo: str = "",
         overwrite: bool = False,
     ) -> None:
+        self._vlog(f"set_meta(strategy={strategy}, weight_type={weight_type}, status={status}, overwrite={overwrite})")
         meta = self.get_meta(strategy)
         if meta and not overwrite:
             self._logger.warning(f"策略 {strategy} 已存在元数据,如需更新请设置 overwrite=True")
@@ -369,12 +395,15 @@ class OnlineManager(BaseManager):
                 ["outsample_sdt", "create_time", "update_time", "heartbeat_time"],
                 tz=self._tz,
             )
+        self._vlog(f"get_strategies_by_status(status={status!r}) → {len(df)} 条")
         return df
 
     # ---------- weights ----------
     def publish_weights(self, strategy: str, df: pd.DataFrame, batch_size: int = 100000) -> None:
+        self._log_publish_entry(strategy, df, table="weights")
+        t0 = time.perf_counter()
         self.heartbeat(strategy)
-        self._publish_dataframe(
+        n = self._publish_dataframe(
             strategy,
             df,
             table="weights",
@@ -383,6 +412,26 @@ class OnlineManager(BaseManager):
             batch_size=batch_size,
         )
         self.heartbeat(strategy)
+        self._logger.info(
+            f"完成 publish_weights(strategy={strategy}, 实际写入 {n} 条, 耗时 {time.perf_counter() - t0:.2f}s)"
+        )
+
+    # ---------- 公共出入口辅助 ----------
+    def _log_publish_entry(self, strategy: str, df: pd.DataFrame, *, table: str) -> None:
+        """publish_weights / publish_returns 共享的入口 INFO 日志(event 档)。
+
+        缺列时不在此处兜底 —— 后续 ``_publish_dataframe`` 会以更清晰的 ``KeyError``
+        定位具体缺哪一列。
+        """
+        if df.empty:
+            n_symbols, dt_lo, dt_hi = 0, "N/A", "N/A"
+        else:
+            n_symbols = int(df["symbol"].nunique())
+            dt_lo, dt_hi = df["dt"].min(), df["dt"].max()
+        self._logger.info(
+            f"开始 publish_{table}(strategy={strategy}, 输入 {len(df)} 行, "
+            f"{n_symbols} 个 symbol, dt ∈ [{dt_lo}, {dt_hi}])"
+        )
 
     def get_strategy_weights(
         self,
@@ -412,6 +461,10 @@ class OnlineManager(BaseManager):
         if not df.empty:
             df = _localize_dataframe_columns(df, ["dt", "update_time"], tz=self._tz)
             df = df.sort_values(["dt", "symbol"]).reset_index(drop=True)
+        self._vlog(
+            f"get_strategy_weights(strategy={strategy}, sdt={sdt}, edt={edt}, "
+            f"symbols={_truncate_seq(symbols)}) → {len(df)} 行"
+        )
         return df
 
     def get_latest_weights(self, strategy: str | None = None) -> pd.DataFrame:
@@ -424,17 +477,23 @@ class OnlineManager(BaseManager):
         if not df.empty:
             df = _localize_dataframe_columns(df, ["dt", "update_time"], tz=self._tz)
             df = df.sort_values(["strategy", "dt", "symbol"]).reset_index(drop=True)
+        self._vlog(f"get_latest_weights(strategy={strategy or 'ALL'}) → {len(df)} 行")
         return df
 
     # ---------- returns ----------
     def publish_returns(self, strategy: str, df: pd.DataFrame, batch_size: int = 100000) -> None:
-        self._publish_dataframe(
+        self._log_publish_entry(strategy, df, table="returns")
+        t0 = time.perf_counter()
+        n = self._publish_dataframe(
             strategy,
             df,
             table="returns",
             value_col="returns",
             mode="upsert",
             batch_size=batch_size,
+        )
+        self._logger.info(
+            f"完成 publish_returns(strategy={strategy}, 实际写入 {n} 条, 耗时 {time.perf_counter() - t0:.2f}s)"
         )
 
     # ---------- publish 流水线钩子 ----------
@@ -484,10 +543,15 @@ class OnlineManager(BaseManager):
         if not df.empty:
             df = _localize_dataframe_columns(df, ["dt", "update_time"], tz=self._tz)
             df = df.sort_values(["dt", "symbol"]).reset_index(drop=True)
+        self._vlog(
+            f"get_strategy_returns(strategy={strategy}, sdt={sdt}, edt={edt}, "
+            f"symbols={_truncate_seq(symbols)}) → {len(df)} 行"
+        )
         return df
 
     # ---------- tags ----------
     def add_tag(self, strategy: str, tag: str, creator: str = "system") -> None:
+        self._vlog(f"add_tag(strategy={strategy}, tag={tag}, creator={creator})")
         now_ts = pd.Timestamp.now(tz=self._tz)
         df = pd.DataFrame([{"strategy": strategy, "tag": tag, "creator": creator, "create_time": now_ts}])
         self.client.insert_df(f"{self._database}.tags", df)
@@ -496,6 +560,7 @@ class OnlineManager(BaseManager):
         rows = list(items)
         if not rows:
             return 0
+        self._vlog(f"add_tags: 输入 {len(rows)} 条, batch_size={batch_size}")
         now_ts = pd.Timestamp.now(tz=self._tz)
         n = 0
         for i in range(0, len(rows), batch_size):
@@ -513,6 +578,8 @@ class OnlineManager(BaseManager):
             )
             self.client.insert_df(f"{self._database}.tags", df)
             n += len(batch)
+            self._vlog(f"add_tags 批次 {i // batch_size + 1}: 写入 {len(batch)} 条")
+        self._vlog(f"add_tags 完成: 处理 {n} 条")
         return n
 
     def list_tags(self, strategy: str | None = None, tag: str | None = None) -> pd.DataFrame:
@@ -531,9 +598,11 @@ class OnlineManager(BaseManager):
         if not df.empty:
             df = _localize_dataframe_columns(df, ["create_time"], tz=self._tz)
             df = df.sort_values(["strategy", "tag"]).reset_index(drop=True)
+        self._vlog(f"list_tags(strategy={strategy}, tag={tag}) → {len(df)} 行")
         return df
 
     def remove_tag(self, strategy: str, tag: str) -> None:
+        self._vlog(f"remove_tag(strategy={strategy}, tag={tag})")
         self.client.command(
             f"DELETE FROM {self._database}.tags WHERE strategy = %(strategy)s AND tag = %(tag)s",
             parameters={"strategy": strategy, "tag": tag},
@@ -553,7 +622,9 @@ class OnlineManager(BaseManager):
                 parameters={"t": current_time, "strategy": strategy},
             )
         except Exception as e:
-            self._logger.error(f"发送心跳失败(已忽略): {e}")
+            self._vexc(f"发送心跳失败(已忽略): {e}")
+            return
+        self._vlog(f"heartbeat({strategy}) ok")
 
     def clear_strategy(self, strategy: str, human_confirm: bool = True) -> None:
         meta = self.get_meta(strategy)
@@ -564,6 +635,7 @@ class OnlineManager(BaseManager):
         c = self.client
         db = self._database
 
+        weights_count = returns_count = tags_count = 0
         try:
             # 合成单条 SQL 一次拿三个表的 count,减少 round-trip
             counts = c.query_df(
@@ -578,33 +650,34 @@ class OnlineManager(BaseManager):
             weights_count = int(counts["weights"])
             returns_count = int(counts["returns"])
             tags_count = int(counts["tags"])
-            self._logger.info(f"策略 {strategy} 数据概况:")
-            self._logger.info(f"  - 策略状态: {meta.get('status', '未知')}")
-            self._logger.info(f"  - 创建时间: {meta.get('create_time', '未知')}")
-            self._logger.info(f"  - 最后更新: {meta.get('update_time', '未知')}")
-            self._logger.info(f"  - 权重数据: {weights_count:,} 条")
-            self._logger.info(f"  - 收益数据: {returns_count:,} 条")
-            self._logger.info(f"  - 标签数据: {tags_count:,} 条")
+            self._logger.info(
+                f"策略 {strategy} 即将清空: status={meta.get('status', '未知')}, "
+                f"weights={weights_count:,}, returns={returns_count:,}, tags={tags_count:,}"
+            )
+            self._vlog(
+                f"  详情: create_time={meta.get('create_time', '未知')}, update_time={meta.get('update_time', '未知')}"
+            )
         except Exception as e:
-            self._logger.error(f"查询策略 {strategy} 数据概况失败: {e}")
+            self._vexc(f"查询策略 {strategy} 数据概况失败: {e}")
             self._logger.info("将继续执行删除操作...")
 
         if human_confirm:
-            self._logger.info("=" * 60)
-            self._logger.info(f"⚠️  警告:即将删除策略 {strategy} 的所有数据")
-            self._logger.info("=" * 60)
-            confirm = input("请仔细确认上述信息,确认删除请输入 'DELETE' (大小写敏感): ")
+            self._logger.warning(f"⚠️  即将删除策略 {strategy} 的所有数据,输入 'DELETE' 确认:")
+            confirm = input("> ")
             if confirm != "DELETE":
                 self._logger.warning(f"取消清空策略 {strategy} 的所有数据")
                 return
-            self._logger.info("开始执行删除操作...")
 
+        t0 = time.perf_counter()
         for table in ("metas", "weights", "returns", "tags"):
             c.command(
                 f"DELETE FROM {db}.{table} WHERE strategy = %(strategy)s",
                 parameters={"strategy": strategy},
             )
-        self._logger.warning(f"策略 {strategy} 清空完成")
+        self._logger.info(
+            f"策略 {strategy} 清空完成: weights={weights_count:,}, returns={returns_count:,}, "
+            f"tags={tags_count:,}, metas=1, 耗时 {time.perf_counter() - t0:.2f}s"
+        )
 
     def summary(self) -> dict:
         c = self.client
@@ -620,14 +693,18 @@ class OnlineManager(BaseManager):
                 (SELECT count(DISTINCT strategy) FROM {db}.metas FINAL) AS strategies
             """
         ).iloc[0]
-        return {
+        result = {
             "metas": int(row["metas"]),
             "weights": int(row["weights"]),
             "returns": int(row["returns"]),
             "tags": int(row["tags"]),
             "strategies": int(row["strategies"]),
         }
+        self._vlog(f"summary → {result}")
+        return result
 
     # ---------- repr ----------
     def __repr__(self) -> str:
-        return f"OnlineManager(dsn={mask_dsn_password(self._dsn)!r}, database={self._database!r})"
+        return (
+            f"OnlineManager(dsn={mask_dsn_password(self._dsn)!r}, database={self._database!r}, verbose={self._verbose})"
+        )
