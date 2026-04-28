@@ -231,13 +231,14 @@ class OnlineManager(BaseManager):
             CREATE VIEW IF NOT EXISTS {db}.cs_latest_weights AS
             WITH latest_dates AS (
                 SELECT strategy, MAX(dt) AS latest_dt
-                FROM {db}.weights GROUP BY strategy
+                FROM {db}.weights FINAL
+                GROUP BY strategy
             )
             SELECT w.dt as dt, w.symbol as symbol, w.weight as weight,
                    w.strategy as strategy, w.update_time as update_time
-            FROM {db}.weights w
+            FROM {db}.weights AS w FINAL
             JOIN latest_dates ld ON w.strategy = ld.strategy AND w.dt = ld.latest_dt
-            JOIN {db}.metas m ON w.strategy = m.strategy
+            JOIN {db}.metas AS m FINAL ON w.strategy = m.strategy
             WHERE m.weight_type = 'cs'
             """
         )
@@ -246,14 +247,15 @@ class OnlineManager(BaseManager):
             CREATE VIEW IF NOT EXISTS {db}.ts_latest_weights AS
             WITH latest_records AS (
                 SELECT strategy, symbol, MAX(dt) AS latest_dt
-                FROM {db}.weights GROUP BY strategy, symbol
+                FROM {db}.weights FINAL
+                GROUP BY strategy, symbol
             )
             SELECT w.dt as dt, w.symbol as symbol, w.weight as weight,
                    w.strategy as strategy, w.update_time as update_time
-            FROM {db}.weights w
+            FROM {db}.weights AS w FINAL
             JOIN latest_records lr
               ON w.strategy = lr.strategy AND w.symbol = lr.symbol AND w.dt = lr.latest_dt
-            JOIN {db}.metas m ON w.strategy = m.strategy
+            JOIN {db}.metas AS m FINAL ON w.strategy = m.strategy
             WHERE m.weight_type = 'ts'
             """
         )
@@ -275,7 +277,9 @@ class OnlineManager(BaseManager):
             parameters={"strategy": strategy},
         )
         if df.empty:
-            self._logger.warning(f"策略 {strategy} 不存在元数据")
+            # get_meta 是底层工具方法(set_meta / heartbeat / clear_strategy 等共享),
+            # 不存在路径走 DEBUG,避免与外层 warning 重复刷屏。
+            self._logger.debug(f"策略 {strategy} 不存在元数据")
             return {}
         df = _localize_dataframe_columns(
             df,
@@ -336,7 +340,7 @@ class OnlineManager(BaseManager):
 
     def update_strategy_status(self, strategy: str, status: str) -> None:
         if status not in VALID_STATUSES:
-            raise ValueError(f"无效的策略状态: {status},有效状态为: {VALID_STATUSES}")
+            raise ValueError(f"无效的策略状态: {status},有效状态为: {sorted(VALID_STATUSES)}")
         meta = self.get_meta(strategy)
         if not meta:
             self._logger.warning(f"策略 {strategy} 不存在,无法更新状态")
@@ -353,7 +357,9 @@ class OnlineManager(BaseManager):
     def get_strategies_by_status(self, status: str | None = None) -> pd.DataFrame:
         sql = f"SELECT * FROM {self._database}.metas FINAL"
         params: dict[str, Any] = {}
-        if status:
+        # 与 LocalManager.get_strategies_by_status 保持 parity:严格 is None 判定
+        # (空字符串 status 视作具体值,走 WHERE 过滤,不静默放弃)。
+        if status is not None:
             sql += " WHERE status = %(status)s"
             params["status"] = status
         df = self.client.query_df(sql, parameters=params)
@@ -368,41 +374,14 @@ class OnlineManager(BaseManager):
     # ---------- weights ----------
     def publish_weights(self, strategy: str, df: pd.DataFrame, batch_size: int = 100000) -> None:
         self.heartbeat(strategy)
-
-        # ---------- 1. 标准化输入 ----------
-        df = df[["dt", "symbol", "weight"]].copy()
-        df["strategy"] = strategy
-        df["dt"] = _ensure_series_tz(df["dt"], tz=self._tz)
-
-        # ---------- 2. 过滤 dt > latest_dt(仅追加) ----------
-        dfl = self.get_latest_weights(strategy)
-        if not dfl.empty:
-            dfl = _localize_dataframe_columns(dfl, ["dt"], tz=self._tz)
-            symbol_dt = dfl.set_index("symbol")["dt"].to_dict()
-            self._logger.info(f"策略 {strategy} 最新时间:{dfl['dt'].max()}")
-            rows: list[pd.DataFrame] = []
-            for symbol, dfg in df.groupby("symbol"):
-                if symbol in symbol_dt:
-                    dfg = dfg[dfg["dt"] > symbol_dt[symbol]].copy().reset_index(drop=True)
-                rows.append(dfg)
-            if rows:
-                df = pd.concat(rows, ignore_index=True)
-            self._logger.info(f"策略 {strategy} 共 {len(df)} 条新信号")
-
-        # ---------- 3. 排序 + 去重 ----------
-        df = df.sort_values(["dt", "symbol"]).reset_index(drop=True)
-        df["update_time"] = pd.Timestamp.now(tz=self._tz)
-        df = df[["strategy", "symbol", "dt", "weight", "update_time"]].copy()
-        df = df.drop_duplicates(["symbol", "dt", "strategy"], keep="last").reset_index(drop=True)
-        df["weight"] = df["weight"].astype(float)
-
-        # ---------- 4. 分批写入 + heartbeat ----------
-        for i in range(0, len(df), batch_size):
-            batch = df.iloc[i : i + batch_size]
-            self.client.insert_df(f"{self._database}.weights", batch)
-            self.heartbeat(strategy)
-            self._logger.info(f"完成批次 {i // batch_size + 1},发布 {len(batch)} 条信号")
-        self._logger.info(f"完成所有信号发布,共 {len(df)} 条")
+        self._publish_dataframe(
+            strategy,
+            df,
+            table="weights",
+            value_col="weight",
+            mode="append",
+            batch_size=batch_size,
+        )
         self.heartbeat(strategy)
 
     def get_strategy_weights(
@@ -449,43 +428,31 @@ class OnlineManager(BaseManager):
 
     # ---------- returns ----------
     def publish_returns(self, strategy: str, df: pd.DataFrame, batch_size: int = 100000) -> None:
-        # ---------- 1. 标准化输入 ----------
-        df = df[["dt", "symbol", "returns"]].copy()
-        df["strategy"] = strategy
-        df["dt"] = _ensure_series_tz(df["dt"], tz=self._tz)
+        self._publish_dataframe(
+            strategy,
+            df,
+            table="returns",
+            value_col="returns",
+            mode="upsert",
+            batch_size=batch_size,
+        )
 
-        # ---------- 2. 过滤 dt >= latest_dt(允许覆盖同日) ----------
-        dfl = self.client.query_df(
-            f"SELECT symbol, max(dt) AS dt FROM {self._database}.returns FINAL "
+    # ---------- publish 流水线钩子 ----------
+    def _query_symbol_latest_dt(self, strategy: str, table: str) -> dict[str, pd.Timestamp]:
+        """直查 ClickHouse FINAL 表获取每个 symbol 的 latest_dt。"""
+        df = self.client.query_df(
+            f"SELECT symbol, max(dt) AS dt FROM {self._database}.{table} FINAL "
             "WHERE strategy = %(strategy)s GROUP BY symbol",
             parameters={"strategy": strategy},
         )
-        if not dfl.empty:
-            dfl["dt"] = _ensure_series_tz(dfl["dt"], tz=self._tz)
-            symbol_dt = dfl.set_index("symbol")["dt"].to_dict()
-            self._logger.info(f"策略 {strategy} 最新时间:{dfl['dt'].max()}")
-            rows: list[pd.DataFrame] = []
-            for symbol, dfg in df.groupby("symbol"):
-                if symbol in symbol_dt:
-                    dfg = dfg[dfg["dt"] >= symbol_dt[symbol]].copy()
-                rows.append(dfg)
-            if rows:
-                df = pd.concat(rows, ignore_index=True)
-            self._logger.info(f"策略 {strategy} 共 {len(df)} 条新日收益")
+        if df.empty:
+            return {}
+        df["dt"] = _ensure_series_tz(df["dt"], tz=self._tz)
+        return df.set_index("symbol")["dt"].to_dict()
 
-        # ---------- 3. 排序 + 去重 ----------
-        df = df.sort_values(["dt", "symbol"]).reset_index(drop=True)
-        df["update_time"] = pd.Timestamp.now(tz=self._tz)
-        df = df[["strategy", "symbol", "dt", "returns", "update_time"]].copy()
-        df = df.drop_duplicates(["symbol", "dt", "strategy"], keep="last").reset_index(drop=True)
-        df["returns"] = df["returns"].astype(float)
-
-        # ---------- 4. 分批写入 ----------
-        for i in range(0, len(df), batch_size):
-            batch = df.iloc[i : i + batch_size]
-            self.client.insert_df(f"{self._database}.returns", batch)
-            self._logger.info(f"完成批次 {i // batch_size + 1},发布 {len(batch)} 条日收益")
-        self._logger.info(f"完成所有日收益发布,共 {len(df)} 条")
+    def _insert_publish_batch(self, table: str, batch: pd.DataFrame) -> None:
+        """ClickHouse 直接 insert_df,clickhouse-connect 会处理时区列序列化。"""
+        self.client.insert_df(f"{self._database}.{table}", batch)
 
     def get_strategy_returns(
         self,
@@ -579,14 +546,14 @@ class OnlineManager(BaseManager):
             self._logger.warning(f"策略 {strategy} 不存在元数据,无法发送心跳")
             return
         current_time = _format_for_db(pd.Timestamp.now(tz=self._tz), tz=self._tz)
+        # heartbeat 是观测信号,失败不应阻断业务写入(对齐 LocalManager 非阻断行为)。
         try:
             self.client.command(
                 f"ALTER TABLE {self._database}.metas UPDATE heartbeat_time = %(t)s WHERE strategy = %(strategy)s",
                 parameters={"t": current_time, "strategy": strategy},
             )
         except Exception as e:
-            self._logger.error(f"发送心跳失败: {e}")
-            raise
+            self._logger.error(f"发送心跳失败(已忽略): {e}")
 
     def clear_strategy(self, strategy: str, human_confirm: bool = True) -> None:
         meta = self.get_meta(strategy)
@@ -598,18 +565,19 @@ class OnlineManager(BaseManager):
         db = self._database
 
         try:
-            weights_count = c.query_df(
-                f"SELECT count(*) as count FROM {db}.weights FINAL WHERE strategy = %(strategy)s",
+            # 合成单条 SQL 一次拿三个表的 count,减少 round-trip
+            counts = c.query_df(
+                f"""
+                SELECT
+                    (SELECT count() FROM {db}.weights FINAL WHERE strategy = %(strategy)s) AS weights,
+                    (SELECT count() FROM {db}.returns FINAL WHERE strategy = %(strategy)s) AS returns,
+                    (SELECT count() FROM {db}.tags FINAL WHERE strategy = %(strategy)s) AS tags
+                """,
                 parameters={"strategy": strategy},
-            ).iloc[0]["count"]
-            returns_count = c.query_df(
-                f"SELECT count(*) as count FROM {db}.returns FINAL WHERE strategy = %(strategy)s",
-                parameters={"strategy": strategy},
-            ).iloc[0]["count"]
-            tags_count = c.query_df(
-                f"SELECT count(*) as count FROM {db}.tags FINAL WHERE strategy = %(strategy)s",
-                parameters={"strategy": strategy},
-            ).iloc[0]["count"]
+            ).iloc[0]
+            weights_count = int(counts["weights"])
+            returns_count = int(counts["returns"])
+            tags_count = int(counts["tags"])
             self._logger.info(f"策略 {strategy} 数据概况:")
             self._logger.info(f"  - 策略状态: {meta.get('status', '未知')}")
             self._logger.info(f"  - 创建时间: {meta.get('create_time', '未知')}")
@@ -641,12 +609,23 @@ class OnlineManager(BaseManager):
     def summary(self) -> dict:
         c = self.client
         db = self._database
+        # 一次往返拿全部 5 个计数,避免 5 次 round-trip 在跨机房链路上叠加延迟
+        row = c.query_df(
+            f"""
+            SELECT
+                (SELECT count() FROM {db}.metas FINAL) AS metas,
+                (SELECT count() FROM {db}.weights FINAL) AS weights,
+                (SELECT count() FROM {db}.returns FINAL) AS returns,
+                (SELECT count() FROM {db}.tags FINAL) AS tags,
+                (SELECT count(DISTINCT strategy) FROM {db}.metas FINAL) AS strategies
+            """
+        ).iloc[0]
         return {
-            "metas": c.query_df(f"SELECT count(*) as c FROM {db}.metas FINAL").iloc[0]["c"],
-            "weights": c.query_df(f"SELECT count(*) as c FROM {db}.weights FINAL").iloc[0]["c"],
-            "returns": c.query_df(f"SELECT count(*) as c FROM {db}.returns FINAL").iloc[0]["c"],
-            "tags": c.query_df(f"SELECT count(*) as c FROM {db}.tags FINAL").iloc[0]["c"],
-            "strategies": c.query_df(f"SELECT count(DISTINCT strategy) as c FROM {db}.metas FINAL").iloc[0]["c"],
+            "metas": int(row["metas"]),
+            "weights": int(row["weights"]),
+            "returns": int(row["returns"]),
+            "tags": int(row["tags"]),
+            "strategies": int(row["strategies"]),
         }
 
     # ---------- repr ----------

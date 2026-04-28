@@ -133,6 +133,22 @@ class TestMaskDsnPassword:
         out = mask_dsn_password("not a valid dsn")
         assert isinstance(out, str)
 
+    def test_password_with_special_chars_fully_masked(self):
+        """密码含 ``:`` / ``@`` 等特殊字符(percent-encoded)时,脱敏后不应残留任何片段。"""
+        dsn = "clickhouse://alice:p%40ss%3Aword@host:9000/db"
+        out = mask_dsn_password(dsn)
+        # 脱敏后绝不允许出现原始或 URL-encoded 形式的密码片段
+        assert "p%40ss%3Aword" not in out
+        assert "p@ss:word" not in out
+        assert "***" in out
+        assert out.startswith("clickhouse://alice:***@host:9000")
+
+    def test_password_only_no_user(self):
+        """空 user + 有 password 仍能正确脱敏。"""
+        out = mask_dsn_password("clickhouse://:secret@host/db")
+        assert "secret" not in out
+        assert "***" in out
+
 
 # ---------- 参数化:不同时区输入统一收敛 ----------
 @pytest.mark.parametrize(

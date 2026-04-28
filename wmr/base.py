@@ -19,18 +19,24 @@
 
 from __future__ import annotations
 
+import operator
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 import pandas as pd
 
+from wmr.utils import _ensure_series_tz
+
+if TYPE_CHECKING:
+    from zoneinfo import ZoneInfo
+
 _BaseManagerT = TypeVar("_BaseManagerT", bound="BaseManager")
 
-VALID_STATUSES: list[str] = ["实盘", "废弃"]
-"""策略合法状态枚举,对齐 cwc.update_strategy_status。"""
+VALID_STATUSES: frozenset[str] = frozenset({"实盘", "废弃"})
+"""策略合法状态枚举,对齐 cwc.update_strategy_status。``frozenset`` 防止运行时被 mutate。"""
 
-VALID_WEIGHT_TYPES: list[str] = ["ts", "cs"]
+VALID_WEIGHT_TYPES: frozenset[str] = frozenset({"ts", "cs"})
 """策略权重类型枚举:``ts`` 时序、``cs`` 截面。"""
 
 
@@ -42,6 +48,10 @@ class BaseManager(ABC):
     操作接口。子类实现需保证:**双后端等价**——同样输入下,``LocalManager``
     与 ``OnlineManager`` 的所有公共 API 必须返回语义一致的结果。
     """
+
+    # 子类构造函数必须设置以下属性,模板方法 ``_publish_dataframe`` 会读取它们。
+    _logger: Any
+    _tz: ZoneInfo
 
     # ---------- 生命周期 ----------
     @abstractmethod
@@ -242,12 +252,18 @@ class BaseManager(ABC):
     def add_tags(self, items: Iterable[tuple[str, str]], batch_size: int = 500) -> int:
         """批量添加标签。
 
+        ⚠️ 与 ``add_tag`` 不同,本方法**不接受 creator 字段**——批量写入时
+        ``creator`` 固定写为 ``"system"``,这是为了对齐 cwc.py 的入参签名
+        (``Iterable[tuple[str, str]]``)。如需为标签指定具体 creator,请逐条
+        调用 ``add_tag(strategy, tag, creator=...)``。
+
         Args:
             items: ``(strategy, tag)`` 二元组迭代器。
             batch_size: 分批大小,默认 500。
 
         Returns:
-            写入条数。
+            处理的输入条数(注意:不区分 "新增" 与 "覆盖" — 同一
+            ``(strategy, tag)`` 重复出现也计入)。
         """
 
     @abstractmethod
@@ -293,3 +309,90 @@ class BaseManager(ABC):
             dict,至少包含 ``metas`` / ``weights`` / ``returns`` / ``tags`` /
             ``strategies`` 五个键。
         """
+
+    # ---------- publish 流水线模板(双后端共享) ----------
+    @abstractmethod
+    def _query_symbol_latest_dt(self, strategy: str, table: str) -> dict[str, pd.Timestamp]:
+        """返回 ``{symbol: latest_dt}``。
+
+        ``publish_*`` 流水线在过滤"仅追加 / 允许覆盖"时调用此钩子。表为空或策略
+        无历史数据时返回空 dict。
+
+        Args:
+            strategy: 策略名。
+            table: ``"weights"`` 或 ``"returns"``。
+
+        Returns:
+            带时区(``self._tz``)的 ``pd.Timestamp`` 字典。
+        """
+
+    @abstractmethod
+    def _insert_publish_batch(self, table: str, batch: pd.DataFrame) -> None:
+        """把一批已规范化的 DataFrame 写入指定表(子类负责时间戳格式适配)。
+
+        Args:
+            table: 目标表名(``"weights"`` / ``"returns"``)。
+            batch: 含 ``strategy / symbol / dt / <value_col> / update_time`` 的
+                DataFrame,``dt`` / ``update_time`` 带时区。
+        """
+
+    def _publish_dataframe(
+        self,
+        strategy: str,
+        df: pd.DataFrame,
+        *,
+        table: Literal["weights", "returns"],
+        value_col: str,
+        mode: Literal["append", "upsert"],
+        batch_size: int,
+    ) -> None:
+        """`publish_weights` / `publish_returns` 共享流水线。
+
+        4 步标准化流程:
+
+        1. 抽列 + 附 strategy + 时区归一
+        2. 按 ``mode`` 过滤:``append`` 仅 ``dt > latest``,``upsert`` 允许 ``dt >= latest``
+        3. 排序、去重、float 化、加 ``update_time``
+        4. ``batch_size`` 分批调用 ``_insert_publish_batch``
+
+        Args:
+            strategy: 策略名。
+            df: 输入 DataFrame,必含 ``dt`` / ``symbol`` / ``<value_col>`` 三列。
+            table: 目标表(决定 latest_dt 查询源)。
+            value_col: 业务值列名(``weight`` / ``returns``)。
+            mode: ``append`` = 仅追加;``upsert`` = 允许覆盖同日。
+            batch_size: 分批大小。
+        """
+        # ---------- 1. 标准化输入 ----------
+        df = df[["dt", "symbol", value_col]].copy()
+        df["strategy"] = strategy
+        df["dt"] = _ensure_series_tz(df["dt"], tz=self._tz)
+
+        # ---------- 2. 过滤 latest_dt ----------
+        symbol_dt = self._query_symbol_latest_dt(strategy, table)
+        if symbol_dt:
+            cmp = operator.gt if mode == "append" else operator.ge
+            self._logger.info(f"策略 {strategy} 最新时间:{max(symbol_dt.values())}")
+            rows: list[pd.DataFrame] = []
+            for symbol, dfg in df.groupby("symbol"):
+                latest_dt = symbol_dt.get(str(symbol))
+                if latest_dt is not None:
+                    dfg = dfg[cmp(dfg["dt"], latest_dt)].copy().reset_index(drop=True)
+                rows.append(dfg)
+            if rows:
+                df = pd.concat(rows, ignore_index=True)
+            self._logger.info(f"策略 {strategy} 共 {len(df)} 条新数据")
+
+        # ---------- 3. 排序 + 去重 + 加 update_time ----------
+        df = df.sort_values(["dt", "symbol"]).reset_index(drop=True)
+        df["update_time"] = pd.Timestamp.now(tz=self._tz)
+        df = df[["strategy", "symbol", "dt", value_col, "update_time"]].copy()
+        df = df.drop_duplicates(["symbol", "dt", "strategy"], keep="last").reset_index(drop=True)
+        df[value_col] = df[value_col].astype(float)
+
+        # ---------- 4. 分批写入 ----------
+        for i in range(0, len(df), batch_size):
+            batch = df.iloc[i : i + batch_size]
+            self._insert_publish_batch(table, batch)
+            self._logger.info(f"完成批次 {i // batch_size + 1},发布 {len(batch)} 条 {table}")
+        self._logger.info(f"完成所有 {table} 发布,共 {len(df)} 条")

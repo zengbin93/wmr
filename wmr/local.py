@@ -38,33 +38,18 @@ from wmr.base import VALID_STATUSES, BaseManager
 from wmr.utils import (
     DEFAULT_TZ,
     _ensure_series_tz,
-    _ensure_timestamp,
     _localize_dataframe_columns,
+    _series_to_naive,
+    _to_naive,
 )
+
+# `_to_naive` / `_series_to_naive` 已移至 ``wmr.utils``,此处仅以 re-export 形式
+# 保留 ``from wmr.local import _to_naive`` 的内部使用路径(下划线开头属于私有 API,
+# 不作公开兼容承诺;不列入 ``__all__``,``from wmr.local import *`` 不会导出它们)。
+__all__ = ["DEFAULT_LOCAL_DB_PATH", "LocalManager"]
 
 DEFAULT_LOCAL_DB_PATH: str = os.environ.get("WMR_LOCAL_DB_PATH", str(Path.home() / ".wmr" / "weights.duckdb"))
 """LocalManager 默认 db 路径,可通过 ``WMR_LOCAL_DB_PATH`` 环境变量覆盖。"""
-
-
-def _to_naive(ts: Any) -> pd.Timestamp | None:
-    """将带时区的时间对象转为 naive(去掉 tz),供 DuckDB ``TIMESTAMP`` 列存储。
-
-    Args:
-        ts: 任意可被 ``pd.to_datetime`` 解析的时间值。
-
-    Returns:
-        naive Timestamp;无效输入返回 ``None``。
-    """
-    t = _ensure_timestamp(ts)
-    if not isinstance(t, pd.Timestamp):
-        return None
-    return t.tz_convert(DEFAULT_TZ).tz_localize(None)
-
-
-def _series_to_naive(series: pd.Series) -> pd.Series:
-    """Series 版的 ``_to_naive``。"""
-    s = _ensure_series_tz(series)
-    return s.dt.tz_convert(DEFAULT_TZ).dt.tz_localize(None)
 
 
 class LocalManager(BaseManager):
@@ -220,7 +205,9 @@ class LocalManager(BaseManager):
         c = self.conn
         df = c.execute("SELECT * FROM metas WHERE strategy = ?", [strategy]).df()
         if df.empty:
-            self._logger.warning(f"策略 {strategy} 不存在元数据")
+            # get_meta 是底层工具方法,被 set_meta / heartbeat / clear_strategy 等多处调用,
+            # 不存在路径走 DEBUG,避免与外层 warning 重复打印。
+            self._logger.debug(f"策略 {strategy} 不存在元数据")
             return {}
         df = _localize_dataframe_columns(
             df, ["outsample_sdt", "create_time", "update_time", "heartbeat_time"], tz=self._tz
@@ -285,7 +272,7 @@ class LocalManager(BaseManager):
 
     def update_strategy_status(self, strategy: str, status: str) -> None:
         if status not in VALID_STATUSES:
-            raise ValueError(f"无效的策略状态: {status},有效状态为: {VALID_STATUSES}")
+            raise ValueError(f"无效的策略状态: {status},有效状态为: {sorted(VALID_STATUSES)}")
         meta = self.get_meta(strategy)
         if not meta:
             self._logger.warning(f"策略 {strategy} 不存在,无法更新状态")
@@ -313,43 +300,14 @@ class LocalManager(BaseManager):
     # ---------- weights ----------
     def publish_weights(self, strategy: str, df: pd.DataFrame, batch_size: int = 100000) -> None:
         self.heartbeat(strategy)
-
-        # ---------- 1. 标准化输入 ----------
-        df = df[["dt", "symbol", "weight"]].copy()
-        df["strategy"] = strategy
-        df["dt"] = _ensure_series_tz(df["dt"], tz=self._tz)
-
-        # ---------- 2. 过滤 dt > latest_dt(仅追加) ----------
-        dfl = self.get_latest_weights(strategy)
-        if not dfl.empty:
-            dfl = _localize_dataframe_columns(dfl, ["dt"], tz=self._tz)
-            symbol_dt = dfl.set_index("symbol")["dt"].to_dict()
-            self._logger.info(f"策略 {strategy} 最新时间:{dfl['dt'].max()}")
-            rows: list[pd.DataFrame] = []
-            for symbol, dfg in df.groupby("symbol"):
-                if symbol in symbol_dt:
-                    dfg = dfg[dfg["dt"] > symbol_dt[symbol]].copy().reset_index(drop=True)
-                rows.append(dfg)
-            if rows:
-                df = pd.concat(rows, ignore_index=True)
-            self._logger.info(f"策略 {strategy} 共 {len(df)} 条新信号")
-
-        # ---------- 3. 排序 + 去重 + 转 naive ----------
-        df = df.sort_values(["dt", "symbol"]).reset_index(drop=True)
-        df["update_time"] = pd.Timestamp.now(tz=self._tz)
-        df = df[["strategy", "symbol", "dt", "weight", "update_time"]].copy()
-        df = df.drop_duplicates(["symbol", "dt", "strategy"], keep="last").reset_index(drop=True)
-        df["weight"] = df["weight"].astype(float)
-        df["dt"] = _series_to_naive(df["dt"])
-        df["update_time"] = _series_to_naive(df["update_time"])
-
-        # ---------- 4. 分批写入 + heartbeat ----------
-        for i in range(0, len(df), batch_size):
-            batch = df.iloc[i : i + batch_size]
-            self._insert_or_replace("weights", batch, key_cols=["strategy", "dt", "symbol"])
-            self.heartbeat(strategy)
-            self._logger.info(f"完成批次 {i // batch_size + 1},发布 {len(batch)} 条信号")
-        self._logger.info(f"完成所有信号发布,共 {len(df)} 条")
+        self._publish_dataframe(
+            strategy,
+            df,
+            table="weights",
+            value_col="weight",
+            mode="append",
+            batch_size=batch_size,
+        )
         self.heartbeat(strategy)
 
     def get_strategy_weights(
@@ -395,44 +353,33 @@ class LocalManager(BaseManager):
 
     # ---------- returns ----------
     def publish_returns(self, strategy: str, df: pd.DataFrame, batch_size: int = 100000) -> None:
-        # ---------- 1. 标准化输入 ----------
-        df = df[["dt", "symbol", "returns"]].copy()
-        df["strategy"] = strategy
-        df["dt"] = _ensure_series_tz(df["dt"], tz=self._tz)
+        self._publish_dataframe(
+            strategy,
+            df,
+            table="returns",
+            value_col="returns",
+            mode="upsert",
+            batch_size=batch_size,
+        )
 
-        # ---------- 2. 过滤 dt >= latest_dt(允许覆盖同日) ----------
-        dfl = self.conn.execute(
-            "SELECT symbol, max(dt) AS dt FROM returns WHERE strategy = ? GROUP BY symbol",
+    # ---------- publish 流水线钩子 ----------
+    def _query_symbol_latest_dt(self, strategy: str, table: str) -> dict[str, pd.Timestamp]:
+        """直查目标表获取每个 symbol 的 latest_dt(比走 latest_weights 视图便宜)。"""
+        df = self.conn.execute(
+            f"SELECT symbol, MAX(dt) AS dt FROM {table} WHERE strategy = ? GROUP BY symbol",
             [strategy],
         ).df()
-        if not dfl.empty:
-            dfl["dt"] = _ensure_series_tz(dfl["dt"], tz=self._tz)
-            symbol_dt = dfl.set_index("symbol")["dt"].to_dict()
-            self._logger.info(f"策略 {strategy} 最新时间:{dfl['dt'].max()}")
-            rows: list[pd.DataFrame] = []
-            for symbol, dfg in df.groupby("symbol"):
-                if symbol in symbol_dt:
-                    dfg = dfg[dfg["dt"] >= symbol_dt[symbol]].copy()
-                rows.append(dfg)
-            if rows:
-                df = pd.concat(rows, ignore_index=True)
-            self._logger.info(f"策略 {strategy} 共 {len(df)} 条新日收益")
+        if df.empty:
+            return {}
+        df["dt"] = _ensure_series_tz(df["dt"], tz=self._tz)
+        return df.set_index("symbol")["dt"].to_dict()
 
-        # ---------- 3. 排序 + 去重 + 转 naive ----------
-        df = df.sort_values(["dt", "symbol"]).reset_index(drop=True)
-        df["update_time"] = pd.Timestamp.now(tz=self._tz)
-        df = df[["strategy", "symbol", "dt", "returns", "update_time"]].copy()
-        df = df.drop_duplicates(["symbol", "dt", "strategy"], keep="last").reset_index(drop=True)
-        df["returns"] = df["returns"].astype(float)
-        df["dt"] = _series_to_naive(df["dt"])
-        df["update_time"] = _series_to_naive(df["update_time"])
-
-        # ---------- 4. 分批写入 ----------
-        for i in range(0, len(df), batch_size):
-            batch = df.iloc[i : i + batch_size]
-            self._insert_or_replace("returns", batch, key_cols=["strategy", "dt", "symbol"])
-            self._logger.info(f"完成批次 {i // batch_size + 1},发布 {len(batch)} 条日收益")
-        self._logger.info(f"完成所有日收益发布,共 {len(df)} 条")
+    def _insert_publish_batch(self, table: str, batch: pd.DataFrame) -> None:
+        """DuckDB 写入前把带时区列转 naive(对应 ``TIMESTAMP`` 列定义)。"""
+        batch = batch.copy()
+        batch["dt"] = _series_to_naive(batch["dt"])
+        batch["update_time"] = _series_to_naive(batch["update_time"])
+        self._insert_or_replace(table, batch, key_cols=["strategy", "dt", "symbol"])
 
     def get_strategy_returns(
         self,
@@ -535,9 +482,19 @@ class LocalManager(BaseManager):
             return
 
         c = self.conn
-        weights_count = self._scalar("SELECT count(*) FROM weights WHERE strategy = ?", [strategy])
-        returns_count = self._scalar("SELECT count(*) FROM returns WHERE strategy = ?", [strategy])
-        tags_count = self._scalar("SELECT count(*) FROM tags WHERE strategy = ?", [strategy])
+        # 一条 SQL 拿三表的 count,与 OnlineManager.clear_strategy 对称
+        row = c.execute(
+            """
+            SELECT
+                (SELECT count(*) FROM weights WHERE strategy = ?) AS weights,
+                (SELECT count(*) FROM returns WHERE strategy = ?) AS returns,
+                (SELECT count(*) FROM tags WHERE strategy = ?) AS tags
+            """,
+            [strategy, strategy, strategy],
+        ).fetchone()
+        weights_count = int(row[0]) if row else 0
+        returns_count = int(row[1]) if row else 0
+        tags_count = int(row[2]) if row else 0
         self._logger.info(f"策略 {strategy} 数据概况:")
         self._logger.info(f"  - 策略状态: {meta.get('status', '未知')}")
         self._logger.info(f"  - 创建时间: {meta.get('create_time', '未知')}")
@@ -563,12 +520,25 @@ class LocalManager(BaseManager):
         self._logger.warning(f"策略 {strategy} 清空完成")
 
     def summary(self) -> dict:
+        # 一条 SQL 拿全部 5 个计数,与 OnlineManager.summary 保持对称
+        row = self.conn.execute(
+            """
+            SELECT
+                (SELECT count(*) FROM metas) AS metas,
+                (SELECT count(*) FROM weights) AS weights,
+                (SELECT count(*) FROM returns) AS returns,
+                (SELECT count(*) FROM tags) AS tags,
+                (SELECT count(DISTINCT strategy) FROM metas) AS strategies
+            """
+        ).fetchone()
+        if row is None:
+            return {"metas": 0, "weights": 0, "returns": 0, "tags": 0, "strategies": 0}
         return {
-            "metas": self._scalar("SELECT count(*) FROM metas"),
-            "weights": self._scalar("SELECT count(*) FROM weights"),
-            "returns": self._scalar("SELECT count(*) FROM returns"),
-            "tags": self._scalar("SELECT count(*) FROM tags"),
-            "strategies": self._scalar("SELECT count(DISTINCT strategy) FROM metas"),
+            "metas": int(row[0]),
+            "weights": int(row[1]),
+            "returns": int(row[2]),
+            "tags": int(row[3]),
+            "strategies": int(row[4]),
         }
 
     def _scalar(self, sql: str, params: list[Any] | None = None) -> Any:
