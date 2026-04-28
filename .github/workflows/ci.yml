@@ -1,0 +1,165 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =========================================================
+  # lint:ruff format + check
+  # =========================================================
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Sync dev deps
+        run: uv sync       - name: ruff format --check
+        run: uv run ruff format --check .
+      - name: ruff check
+        run: uv run ruff check .
+
+  # =========================================================
+  # typecheck:basedpyright
+  # =========================================================
+  typecheck:
+    name: Type check (basedpyright)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Sync dev deps
+        run: uv sync       - name: basedpyright
+        run: uv run basedpyright
+
+  # =========================================================
+  # test:Python 3.10/3.11/3.12 矩阵 + LocalManager + 覆盖率
+  # =========================================================
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+      - name: Sync dev deps
+        run: uv sync --frozen=false --python ${{ matrix.python-version }}
+      - name: Run unit + integration (LocalManager only)
+        run: uv run pytest -m "unit or integration and not online" -v
+      - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.12'
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # =========================================================
+  # online + parity:ClickHouse service container
+  # =========================================================
+  online-test:
+    name: Online + Parity (ClickHouse)
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        ports:
+          - 9000:9000
+          - 8123:8123
+        env:
+          CLICKHOUSE_DB: default
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: ""
+        options: >-
+          --health-cmd "wget --spider -q http://localhost:8123/ping || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Sync dev deps
+        run: uv sync       - name: Wait for ClickHouse
+        run: |
+          for i in {1..30}; do
+            if curl -sf http://localhost:8123/ping; then echo "CH ready"; break; fi
+            sleep 2
+          done
+      - name: Run online + parity tests
+        env:
+          WMR_TEST_CLICKHOUSE_DSN: clickhouse://default:@localhost:9000
+        run: uv run pytest -m "online or parity" -v --no-cov
+
+  # =========================================================
+  # examples:确保 examples/quickstart.py 可直接运行(C6)
+  # =========================================================
+  examples:
+    name: Examples runtime check
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Sync(without dev)
+        run: uv sync --no-dev       - name: Run quickstart
+        run: uv run python examples/quickstart.py
+
+  # =========================================================
+  # perf:手动触发(workflow_dispatch)
+  # =========================================================
+  perf:
+    name: Performance benchmarks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Sync dev deps
+        run: uv sync       - name: Run perf benchmarks
+        run: uv run pytest -m perf --run-perf -v --no-cov

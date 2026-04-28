@@ -1,0 +1,146 @@
+[project]
+name = "wmr"
+version = "0.1.0"
+description = "Weight Manager — 策略持仓权重管理系统(DuckDB / ClickHouse 双后端)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "zengbin93", email = "zeng_bin8888@163.com" }]
+keywords = ["quant", "strategy", "weights", "clickhouse", "duckdb"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    # pandas 3.0 与 numpy 2.3+ 均要求 Python >=3.11
+    # Python 3.10 上回落到 pandas 2.3 / numpy 2.2(各自在 py310 上的最高线)
+    "pandas>=3.0; python_version >= '3.11'",
+    "pandas>=2.3,<3.0; python_version < '3.11'",
+    "numpy>=2.4; python_version >= '3.11'",
+    "numpy>=2.2,<2.3; python_version < '3.11'",
+    "duckdb>=0.9.0",
+    "loguru",
+    "clickhouse-connect>=0.6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/zengbin93/wmr"
+Repository = "https://github.com/zengbin93/wmr"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+    "pytest-xdist>=3.5",
+    "pytest-benchmark>=4.0",
+    "testcontainers[clickhouse]>=4.0",
+    "ruff>=0.5",
+    "basedpyright>=1.13",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# uv 默认包索引:阿里云镜像(中国大陆加速)
+[[tool.uv.index]]
+name = "aliyun"
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["wmr"]
+
+# ============================================================
+# 测试与覆盖率(对应 docs/code-quality.md §1 / §2.3)
+# ============================================================
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --cov=wmr --cov-report=term-missing --cov-report=xml --cov-fail-under=90"
+markers = [
+    "unit: pure-function tests, no I/O",
+    "integration: requires real backend (DuckDB / ClickHouse)",
+    "online: requires ClickHouse (testcontainers)",
+    "parity: cross-backend equivalence",
+    "perf: performance benchmarks (skipped by default)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["wmr"]
+omit = ["wmr/__init__.py"]
+
+[tool.coverage.report]
+fail_under = 90
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+
+# ============================================================
+# ruff:格式化 + lint(对应 docs/code-quality.md §2.1)
+# ============================================================
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+fix = true
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "B",        # flake8-bugbear
+    "C4",       # flake8-comprehensions
+    "UP",       # pyupgrade
+    "SIM",      # flake8-simplify
+    "RET",      # flake8-return
+    "N",        # pep8-naming
+]
+ignore = [
+    "E501",   # line length 由 formatter 控制
+    "B008",   # 函数默认参数允许函数调用(loguru.logger 等)
+    "RET504", # 允许显式赋值再 return,提高可读性
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B011"]  # 测试中允许 assert False
+
+[tool.ruff.lint.isort]
+known-first-party = ["wmr"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# ============================================================
+# basedpyright(对应 docs/code-quality.md §2.2)
+# ============================================================
+[tool.basedpyright]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"
+include = ["wmr", "tests"]
+exclude = [".venv", "build", "dist", "**/__pycache__"]
+reportMissingImports = "error"
+reportMissingTypeStubs = false
+reportUnusedImport = "warning"
+reportPrivateImportUsage = "warning"
+reportUnknownParameterType = false
+reportUnknownArgumentType = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportAny = false
+reportExplicitAny = false
+reportImplicitOverride = false

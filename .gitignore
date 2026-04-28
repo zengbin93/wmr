@@ -5,6 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
+human.md
 
 # Distribution / packaging
 .Python
