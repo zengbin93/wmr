@@ -99,8 +99,12 @@ jobs:
         image: clickhouse/clickhouse-server:24.8
         ports:
           - 8123:8123
-        # 不设置 CLICKHOUSE_USER/PASSWORD,使用镜像内置 default 用户(无密码)
-        # 24.x 上设置 CLICKHOUSE_USER=default 会被拒绝,会触发"用户已存在"逻辑
+        env:
+          # 使用专属测试用户,避免 24.x 默认 default 用户被禁用/带随机密码导致连不上
+          CLICKHOUSE_USER: ci
+          CLICKHOUSE_PASSWORD: ci
+          CLICKHOUSE_DB: default
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
         options: >-
           --health-cmd "wget --spider -q http://localhost:8123/ping || exit 1"
           --health-interval 10s
@@ -124,7 +128,7 @@ jobs:
           done
       - name: Run online + parity tests
         env:
-          WMR_TEST_CLICKHOUSE_DSN: clickhouse://default:@localhost:8123
+          WMR_TEST_CLICKHOUSE_DSN: clickhouse://ci:ci@localhost:8123
         run: uv run pytest -m "online or parity" -v --no-cov
 
   # =========================================================
