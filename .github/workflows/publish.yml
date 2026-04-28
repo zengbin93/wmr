@@ -1,0 +1,124 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # =========================================================
+  # 0. 校验 tag 与 pyproject.toml 中的 version 一致
+  #    避免误打 tag 导致版本错乱
+  # =========================================================
+  verify-tag:
+    name: Verify tag matches pyproject version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag == project.version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PYV=$(grep -m1 '^version' pyproject.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')
+          echo "tag=$TAG  pyproject=$PYV"
+          if [ "$TAG" != "$PYV" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pyproject version $PYV"
+            exit 1
+          fi
+
+  # =========================================================
+  # 1. lint + 单元测试(发布前最低门槛)
+  # =========================================================
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    needs: verify-tag
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Sync dev deps
+        run: uv sync
+      - name: ruff format --check
+        run: uv run ruff format --check .
+      - name: ruff check
+        run: uv run ruff check .
+
+  test:
+    name: Unit + integration tests
+    runs-on: ubuntu-latest
+    needs: verify-tag
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Sync dev deps
+        run: uv sync
+      - name: Run tests (LocalManager only, skip online)
+        run: uv run pytest -m "unit or integration and not online" -v --no-cov
+
+  # =========================================================
+  # 2. 构建 sdist + wheel,作为 artifact 传给下一个 job
+  # =========================================================
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Build sdist + wheel
+        run: uv build
+      - name: Show built artifacts
+        run: ls -la dist/
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # =========================================================
+  # 3. 通过 PyPI Trusted Publishing(OIDC)发布
+  #    需在 https://pypi.org/manage/account/publishing/ 配置:
+  #      - PyPI project: wmr
+  #      - Owner: zengbin93
+  #      - Repository: wmr
+  #      - Workflow: publish.yml
+  #      - Environment: pypi
+  # =========================================================
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: pypi
+      url: https://pypi.org/p/wmr
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
