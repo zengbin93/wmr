@@ -11,12 +11,12 @@ pytestmark = pytest.mark.unit
 
 class TestParseDsn:
     def test_full_dsn(self):
-        out = _parse_dsn("clickhouse://alice:s3cret@127.0.0.1:9000/czsc")
+        out = _parse_dsn("clickhouse://alice:s3cret@127.0.0.1:9000/trade")
         assert out["host"] == "127.0.0.1"
         assert out["port"] == 9000
         assert out["user"] == "alice"
         assert out["password"] == "s3cret"
-        assert out["database"] == "czsc"
+        assert out["database"] == "trade"
 
     def test_no_database_returns_empty_string(self):
         out = _parse_dsn("clickhouse://alice:p@127.0.0.1:9000")
