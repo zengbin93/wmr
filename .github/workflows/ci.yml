@@ -73,7 +73,7 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
       - name: Sync dev deps
-        run: uv sync --frozen=false --python ${{ matrix.python-version }}
+        run: uv sync --python ${{ matrix.python-version }}
       - name: Run unit + integration (LocalManager only)
         run: uv run pytest -m "unit or integration and not online" -v
       - name: Upload coverage to Codecov
@@ -125,7 +125,7 @@ jobs:
           done
       - name: Run online + parity tests
         env:
-          WMR_TEST_CLICKHOUSE_DSN: clickhouse://default:@localhost:9000
+          WMR_TEST_CLICKHOUSE_DSN: clickhouse://default:@localhost:8123
         run: uv run pytest -m "online or parity" -v --no-cov
 
   # =========================================================
