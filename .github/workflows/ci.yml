@@ -27,7 +27,8 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
       - name: Sync dev deps
-        run: uv sync       - name: ruff format --check
+        run: uv sync
+      - name: ruff format --check
         run: uv run ruff format --check .
       - name: ruff check
         run: uv run ruff check .
@@ -48,7 +49,8 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
       - name: Sync dev deps
-        run: uv sync       - name: basedpyright
+        run: uv sync
+      - name: basedpyright
         run: uv run basedpyright
 
   # =========================================================
@@ -114,7 +116,8 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
       - name: Sync dev deps
-        run: uv sync       - name: Wait for ClickHouse
+        run: uv sync
+      - name: Wait for ClickHouse
         run: |
           for i in {1..30}; do
             if curl -sf http://localhost:8123/ping; then echo "CH ready"; break; fi
@@ -141,7 +144,8 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
       - name: Sync(without dev)
-        run: uv sync --no-dev       - name: Run quickstart
+        run: uv sync --no-dev
+      - name: Run quickstart
         run: uv run python examples/quickstart.py
 
   # =========================================================
@@ -161,5 +165,6 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
       - name: Sync dev deps
-        run: uv sync       - name: Run perf benchmarks
+        run: uv sync
+      - name: Run perf benchmarks
         run: uv run pytest -m perf --run-perf -v --no-cov
