@@ -82,3 +82,20 @@ def test_get_all_metas_includes_heartbeat_time_column(local_mgr):
     df = local_mgr.get_all_metas()
     assert "heartbeat_time" in df.columns
     assert df.loc[df["strategy"] == "S1", "heartbeat_time"].notna().all()
+
+
+def test_set_meta_no_overwrite_keeps_heartbeat(local_mgr):
+    """set_meta(overwrite=False) 命中已存在策略时早 return,不应刷新心跳。"""
+    _seed_meta(local_mgr, "S1")
+    hb1 = local_mgr.get_heartbeat("S1")
+    time.sleep(0.05)
+    # overwrite 默认 False:策略已存在,应该 warning 后早返,不写心跳
+    local_mgr.set_meta(
+        strategy="S1",
+        base_freq="日线",
+        description="二次提交",
+        author="tester",
+        outsample_sdt="2024-01-01",
+    )
+    hb2 = local_mgr.get_heartbeat("S1")
+    assert hb1 == hb2, "overwrite=False 命中已存在策略不应刷新 heartbeat"
