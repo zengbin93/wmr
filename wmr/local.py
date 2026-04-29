@@ -632,17 +632,18 @@ class LocalManager(BaseManager):
                 return
 
         t0 = time.perf_counter()
+        c.execute("DELETE FROM heartbeats WHERE strategy = ?", [strategy])
         c.execute("DELETE FROM metas WHERE strategy = ?", [strategy])
         c.execute("DELETE FROM weights WHERE strategy = ?", [strategy])
         c.execute("DELETE FROM returns WHERE strategy = ?", [strategy])
         c.execute("DELETE FROM tags WHERE strategy = ?", [strategy])
         self._logger.info(
             f"策略 {strategy} 清空完成: weights={weights_count:,}, returns={returns_count:,}, "
-            f"tags={tags_count:,}, metas=1, 耗时 {time.perf_counter() - t0:.2f}s"
+            f"tags={tags_count:,}, heartbeats=1, metas=1, 耗时 {time.perf_counter() - t0:.2f}s"
         )
 
     def summary(self) -> dict:
-        # 一条 SQL 拿全部 5 个计数,与 OnlineManager.summary 保持对称
+        # 一条 SQL 拿全部 6 个计数,与 OnlineManager.summary 保持对称
         row = self.conn.execute(
             """
             SELECT
@@ -650,6 +651,7 @@ class LocalManager(BaseManager):
                 (SELECT count(*) FROM weights) AS weights,
                 (SELECT count(*) FROM returns) AS returns,
                 (SELECT count(*) FROM tags) AS tags,
+                (SELECT count(*) FROM heartbeats) AS heartbeats,
                 (SELECT count(DISTINCT strategy) FROM metas) AS strategies
             """
         ).fetchone()
@@ -660,7 +662,8 @@ class LocalManager(BaseManager):
             "weights": int(row[1]),
             "returns": int(row[2]),
             "tags": int(row[3]),
-            "strategies": int(row[4]),
+            "heartbeats": int(row[4]),
+            "strategies": int(row[5]),
         }
         self._vlog(f"summary → {result}")
         return result

@@ -99,3 +99,34 @@ def test_set_meta_no_overwrite_keeps_heartbeat(local_mgr):
     )
     hb2 = local_mgr.get_heartbeat("S1")
     assert hb1 == hb2, "overwrite=False 命中已存在策略不应刷新 heartbeat"
+
+
+def test_clear_strategy_removes_heartbeat(local_mgr):
+    """clear_strategy 同时删 heartbeats 表中该策略的行。"""
+    _seed_meta(local_mgr, "S1")
+    assert local_mgr.get_heartbeat("S1") is not None
+    local_mgr.clear_strategy("S1", human_confirm=False)
+    assert local_mgr.get_heartbeat("S1") is None
+
+
+def test_clear_strategy_other_heartbeats_untouched(local_mgr):
+    """clear_strategy 只删指定策略,其它策略心跳不动。"""
+    _seed_meta(local_mgr, "S1")
+    _seed_meta(local_mgr, "S2")
+    local_mgr.clear_strategy("S1", human_confirm=False)
+    assert local_mgr.get_heartbeat("S2") is not None
+
+
+def test_summary_includes_heartbeats_count(local_mgr):
+    """summary() 返回字典含 heartbeats 字段,值为 heartbeats 表行数。"""
+    _seed_meta(local_mgr, "A")
+    _seed_meta(local_mgr, "B")
+    s = local_mgr.summary()
+    assert "heartbeats" in s
+    assert s["heartbeats"] == 2
+
+
+def test_summary_heartbeats_zero_initially(local_mgr):
+    """空库 summary 的 heartbeats 字段为 0。"""
+    s = local_mgr.summary()
+    assert s["heartbeats"] == 0

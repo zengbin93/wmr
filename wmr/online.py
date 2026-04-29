@@ -718,20 +718,21 @@ class OnlineManager(BaseManager):
                 return
 
         t0 = time.perf_counter()
-        for table in ("metas", "weights", "returns", "tags"):
+        for table in ("metas", "weights", "returns", "tags", "heartbeats"):
             c.command(
                 f"DELETE FROM {db}.{table} WHERE strategy = %(strategy)s",
                 parameters={"strategy": strategy},
             )
         self._logger.info(
             f"策略 {strategy} 清空完成: weights={weights_count:,}, returns={returns_count:,}, "
-            f"tags={tags_count:,}, metas=1, 耗时 {time.perf_counter() - t0:.2f}s"
+            f"tags={tags_count:,}, heartbeats=1, metas=1, 耗时 {time.perf_counter() - t0:.2f}s"
         )
 
     def summary(self) -> dict:
         c = self.client
         db = self._database
-        # 一次往返拿全部 5 个计数,避免 5 次 round-trip 在跨机房链路上叠加延迟
+        # 一次往返拿全部 6 个计数,避免多次 round-trip 在跨机房链路上叠加延迟
+        # heartbeats 是 ReplacingMergeTree,必须 FINAL 才能拿到去重后的"独立 strategy 数"语义。
         row = c.query_df(
             f"""
             SELECT
@@ -739,6 +740,7 @@ class OnlineManager(BaseManager):
                 (SELECT count() FROM {db}.weights FINAL) AS weights,
                 (SELECT count() FROM {db}.returns FINAL) AS returns,
                 (SELECT count() FROM {db}.tags FINAL) AS tags,
+                (SELECT count() FROM {db}.heartbeats FINAL) AS heartbeats,
                 (SELECT count(DISTINCT strategy) FROM {db}.metas FINAL) AS strategies
             """
         ).iloc[0]
@@ -747,6 +749,7 @@ class OnlineManager(BaseManager):
             "weights": int(row["weights"]),
             "returns": int(row["returns"]),
             "tags": int(row["tags"]),
+            "heartbeats": int(row["heartbeats"]),
             "strategies": int(row["strategies"]),
         }
         self._vlog(f"summary → {result}")
