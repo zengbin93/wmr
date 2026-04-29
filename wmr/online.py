@@ -196,7 +196,6 @@ class OnlineManager(BaseManager):
                 outsample_sdt DateTime('Asia/Shanghai'),
                 create_time DateTime('Asia/Shanghai'),
                 update_time DateTime('Asia/Shanghai'),
-                heartbeat_time DateTime('Asia/Shanghai'),
                 weight_type String,
                 status String DEFAULT '实盘',
                 memo String
@@ -249,6 +248,17 @@ class OnlineManager(BaseManager):
         self._vlog(f"创建/复用表: {db}.tags")
         c.command(
             f"""
+            CREATE TABLE IF NOT EXISTS {db}.heartbeats (
+                strategy       String NOT NULL,
+                heartbeat_time DateTime('Asia/Shanghai')
+            )
+            ENGINE = ReplacingMergeTree(heartbeat_time)
+            ORDER BY strategy
+            """
+        )
+        self._vlog(f"创建/复用表: {db}.heartbeats")
+        c.command(
+            f"""
             CREATE VIEW IF NOT EXISTS {db}.cs_latest_weights AS
             WITH latest_dates AS (
                 SELECT strategy, MAX(dt) AS latest_dt
@@ -297,7 +307,12 @@ class OnlineManager(BaseManager):
     def get_meta(self, strategy: str) -> dict:
         c = self.client
         df = c.query_df(
-            f"SELECT * FROM {self._database}.metas FINAL WHERE strategy = %(strategy)s",
+            f"""
+            SELECT m.*, h.heartbeat_time
+            FROM {self._database}.metas AS m FINAL
+            LEFT JOIN {self._database}.heartbeats AS h FINAL ON m.strategy = h.strategy
+            WHERE m.strategy = %(strategy)s
+            """,
             parameters={"strategy": strategy},
         )
         if df.empty:
@@ -313,7 +328,13 @@ class OnlineManager(BaseManager):
         return df.iloc[0].to_dict()
 
     def get_all_metas(self) -> pd.DataFrame:
-        df = self.client.query_df(f"SELECT * FROM {self._database}.metas FINAL")
+        df = self.client.query_df(
+            f"""
+            SELECT m.*, h.heartbeat_time
+            FROM {self._database}.metas AS m FINAL
+            LEFT JOIN {self._database}.heartbeats AS h FINAL ON m.strategy = h.strategy
+            """
+        )
         if not df.empty:
             df = _localize_dataframe_columns(
                 df,
@@ -354,7 +375,6 @@ class OnlineManager(BaseManager):
                     "outsample_sdt": outsample_ts,
                     "create_time": create_time,
                     "update_time": current_time,
-                    "heartbeat_time": current_time,
                     "weight_type": weight_type,
                     "status": status,
                     "memo": memo,
@@ -363,6 +383,7 @@ class OnlineManager(BaseManager):
         )
         self.client.insert_df(f"{self._database}.metas", df)
         self._logger.info(f"{strategy} set_meta: ok")
+        self.heartbeat(strategy)
 
     def update_strategy_status(self, strategy: str, status: str) -> None:
         if status not in VALID_STATUSES:
@@ -381,12 +402,16 @@ class OnlineManager(BaseManager):
         self._logger.info(f"策略 {strategy} 状态已更新为: {status}")
 
     def get_strategies_by_status(self, status: str | None = None) -> pd.DataFrame:
-        sql = f"SELECT * FROM {self._database}.metas FINAL"
+        sql = f"""
+            SELECT m.*, h.heartbeat_time
+            FROM {self._database}.metas AS m FINAL
+            LEFT JOIN {self._database}.heartbeats AS h FINAL ON m.strategy = h.strategy
+        """
         params: dict[str, Any] = {}
         # 与 LocalManager.get_strategies_by_status 保持 parity:严格 is None 判定
         # (空字符串 status 视作具体值,走 WHERE 过滤,不静默放弃)。
         if status is not None:
-            sql += " WHERE status = %(status)s"
+            sql += " WHERE m.status = %(status)s"
             params["status"] = status
         df = self.client.query_df(sql, parameters=params)
         if not df.empty:
@@ -618,8 +643,8 @@ class OnlineManager(BaseManager):
         # heartbeat 是观测信号,失败不应阻断业务写入(对齐 LocalManager 非阻断行为)。
         try:
             self.client.command(
-                f"ALTER TABLE {self._database}.metas UPDATE heartbeat_time = %(t)s WHERE strategy = %(strategy)s",
-                parameters={"t": current_time, "strategy": strategy},
+                f"INSERT INTO {self._database}.heartbeats (strategy, heartbeat_time) VALUES (%(strategy)s, %(t)s)",
+                parameters={"strategy": strategy, "t": current_time},
             )
         except Exception as e:
             self._vexc(f"发送心跳失败(已忽略): {e}")
@@ -627,12 +652,28 @@ class OnlineManager(BaseManager):
         self._vlog(f"heartbeat({strategy}) ok")
 
     def get_heartbeat(self, strategy: str) -> pd.Timestamp | None:
-        # Task 3 替换为读 heartbeats 表的真实实现
-        return None
+        df = self.client.query_df(
+            f"SELECT heartbeat_time FROM {self._database}.heartbeats FINAL "
+            "WHERE strategy = %(strategy)s",
+            parameters={"strategy": strategy},
+        )
+        if df.empty:
+            self._vlog(f"get_heartbeat({strategy}) → None")
+            return None
+        df = _localize_dataframe_columns(df, ["heartbeat_time"], tz=self._tz)
+        ts = df.iloc[0]["heartbeat_time"]
+        self._vlog(f"get_heartbeat({strategy}) → {ts}")
+        return ts
 
     def list_heartbeats(self) -> pd.DataFrame:
-        # Task 3 替换为读 heartbeats 表的真实实现
-        return pd.DataFrame(columns=["strategy", "heartbeat_time"])
+        df = self.client.query_df(
+            f"SELECT strategy, heartbeat_time FROM {self._database}.heartbeats FINAL "
+            "ORDER BY heartbeat_time DESC"
+        )
+        if not df.empty:
+            df = _localize_dataframe_columns(df, ["heartbeat_time"], tz=self._tz)
+        self._vlog(f"list_heartbeats → {len(df)} 行")
+        return df
 
     def clear_strategy(self, strategy: str, human_confirm: bool = True) -> None:
         meta = self.get_meta(strategy)
