@@ -94,6 +94,10 @@ EXPECTED_SIGNATURES: dict[str, list[tuple[str, Any]]] = {
     "heartbeat": [
         ("strategy", _NO_DEFAULT),
     ],
+    "get_heartbeat": [
+        ("strategy", _NO_DEFAULT),
+    ],
+    "list_heartbeats": [],
     "clear_strategy": [
         ("strategy", _NO_DEFAULT),
         ("human_confirm", True),

@@ -104,18 +104,30 @@ def test_get_latest_weights_cs_shared_dt(local_mgr):
 
 
 def test_heartbeat_updates_strictly_increasing(local_mgr):
-    """F6:publish_weights 调用前后 heartbeat_time 严格递增。"""
-    local_mgr.set_meta("ts1", "1d", "", "u", "2024-01-01", weight_type="ts")
-    before = local_mgr.get_meta("ts1")["heartbeat_time"]
-
-    time.sleep(1.1)  # 秒级精度
-    local_mgr.publish_weights(
-        "ts1",
-        pd.DataFrame({"dt": ["2024-01-01"], "symbol": ["X"], "weight": [0.1]}),
+    """F6:publish_weights 完成后 heartbeat_time 严格递增,且仅在 end 调一次心跳。"""
+    local_mgr.set_meta(
+        strategy="ts1",
+        base_freq="日线",
+        description="d",
+        author="a",
+        outsample_sdt="2024-01-01",
     )
-    after = local_mgr.get_meta("ts1")["heartbeat_time"]
-    assert after >= before
-    assert after > before
+    before = local_mgr.get_heartbeat("ts1")
+    time.sleep(0.05)
+
+    df = pd.DataFrame(
+        {
+            "dt": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+            "symbol": ["AAA", "AAA"],
+            "weight": [0.5, 0.6],
+        }
+    )
+    local_mgr.publish_weights("ts1", df)
+
+    after = local_mgr.get_heartbeat("ts1")
+    assert after > before, "publish 后 heartbeat 应严格大于 publish 前"
+    # parity: 同一 strategy 多次心跳 UPSERT,行数不变
+    assert (local_mgr.list_heartbeats()["strategy"] == "ts1").sum() == 1
 
 
 def test_get_strategy_weights_with_filters(local_mgr):

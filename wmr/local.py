@@ -135,7 +135,6 @@ class LocalManager(BaseManager):
                     outsample_sdt TIMESTAMP,
                     create_time TIMESTAMP,
                     update_time TIMESTAMP,
-                    heartbeat_time TIMESTAMP,
                     weight_type VARCHAR,
                     status VARCHAR DEFAULT '实盘',
                     memo VARCHAR
@@ -177,6 +176,15 @@ class LocalManager(BaseManager):
                     creator VARCHAR DEFAULT 'system',
                     create_time TIMESTAMP,
                     PRIMARY KEY (strategy, tag)
+                )
+                """,
+            ),
+            (
+                "heartbeats",
+                """
+                CREATE TABLE IF NOT EXISTS heartbeats (
+                    strategy       VARCHAR PRIMARY KEY,
+                    heartbeat_time TIMESTAMP
                 )
                 """,
             ),
@@ -227,7 +235,15 @@ class LocalManager(BaseManager):
     # ---------- metas ----------
     def get_meta(self, strategy: str) -> dict:
         c = self.conn
-        df = c.execute("SELECT * FROM metas WHERE strategy = ?", [strategy]).df()
+        df = c.execute(
+            """
+            SELECT m.*, h.heartbeat_time
+            FROM metas m
+            LEFT JOIN heartbeats h ON m.strategy = h.strategy
+            WHERE m.strategy = ?
+            """,
+            [strategy],
+        ).df()
         if df.empty:
             # get_meta 是底层工具方法,被 set_meta / heartbeat / clear_strategy 等多处调用,
             # 不存在路径走 DEBUG,避免与外层 warning 重复打印。
@@ -239,7 +255,13 @@ class LocalManager(BaseManager):
         return df.iloc[0].to_dict()
 
     def get_all_metas(self) -> pd.DataFrame:
-        df = self.conn.execute("SELECT * FROM metas").df()
+        df = self.conn.execute(
+            """
+            SELECT m.*, h.heartbeat_time
+            FROM metas m
+            LEFT JOIN heartbeats h ON m.strategy = h.strategy
+            """
+        ).df()
         if not df.empty:
             df = _localize_dataframe_columns(
                 df,
@@ -277,8 +299,8 @@ class LocalManager(BaseManager):
             """
             INSERT INTO metas
             (strategy, base_freq, description, author, outsample_sdt, create_time,
-             update_time, heartbeat_time, weight_type, status, memo)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             update_time, weight_type, status, memo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 strategy,
@@ -288,13 +310,13 @@ class LocalManager(BaseManager):
                 outsample_naive,
                 create_naive,
                 now_naive,
-                now_naive,
                 weight_type,
                 status,
                 memo,
             ],
         )
         self._logger.info(f"{strategy} set_meta: ok")
+        self.heartbeat(strategy)
 
     def update_strategy_status(self, strategy: str, status: str) -> None:
         if status not in VALID_STATUSES:
@@ -311,10 +333,16 @@ class LocalManager(BaseManager):
         self._logger.info(f"策略 {strategy} 状态已更新为: {status}")
 
     def get_strategies_by_status(self, status: str | None = None) -> pd.DataFrame:
-        if status is None:
-            df = self.conn.execute("SELECT * FROM metas").df()
-        else:
-            df = self.conn.execute("SELECT * FROM metas WHERE status = ?", [status]).df()
+        sql = """
+            SELECT m.*, h.heartbeat_time
+            FROM metas m
+            LEFT JOIN heartbeats h ON m.strategy = h.strategy
+        """
+        params: list = []
+        if status is not None:
+            sql += " WHERE m.status = ?"
+            params.append(status)
+        df = self.conn.execute(sql, params).df()
         if not df.empty:
             df = _localize_dataframe_columns(
                 df,
@@ -328,7 +356,6 @@ class LocalManager(BaseManager):
     def publish_weights(self, strategy: str, df: pd.DataFrame, batch_size: int = 100000) -> None:
         self._log_publish_entry(strategy, df, table="weights")
         t0 = time.perf_counter()
-        self.heartbeat(strategy)
         n = self._publish_dataframe(
             strategy,
             df,
@@ -400,6 +427,7 @@ class LocalManager(BaseManager):
             mode="upsert",
             batch_size=batch_size,
         )
+        self.heartbeat(strategy)
         self._logger.info(
             f"完成 publish_returns(strategy={strategy}, 实际写入 {n} 条, 耗时 {time.perf_counter() - t0:.2f}s)"
         )
@@ -538,12 +566,33 @@ class LocalManager(BaseManager):
         if not meta:
             self._logger.warning(f"策略 {strategy} 不存在元数据,无法发送心跳")
             return
-        now_naive = _to_naive(pd.Timestamp.now(tz=self._tz))
-        self.conn.execute(
-            "UPDATE metas SET heartbeat_time = ? WHERE strategy = ?",
-            [now_naive, strategy],
+        c = self.conn
+        current_time = pd.Timestamp.now(tz=self._tz).to_pydatetime().replace(tzinfo=None)
+        c.execute(
+            "INSERT OR REPLACE INTO heartbeats (strategy, heartbeat_time) VALUES (?, ?)",
+            [strategy, current_time],
         )
         self._vlog(f"heartbeat({strategy}) ok")
+
+    def get_heartbeat(self, strategy: str) -> pd.Timestamp | None:
+        df = self.conn.execute(
+            "SELECT heartbeat_time FROM heartbeats WHERE strategy = ?",
+            [strategy],
+        ).df()
+        if df.empty:
+            self._vlog(f"get_heartbeat({strategy}) → None")
+            return None
+        df = _localize_dataframe_columns(df, ["heartbeat_time"], tz=self._tz)
+        ts = df.iloc[0]["heartbeat_time"]
+        self._vlog(f"get_heartbeat({strategy}) → {ts}")
+        return ts
+
+    def list_heartbeats(self) -> pd.DataFrame:
+        df = self.conn.execute("SELECT strategy, heartbeat_time FROM heartbeats ORDER BY heartbeat_time DESC").df()
+        if not df.empty:
+            df = _localize_dataframe_columns(df, ["heartbeat_time"], tz=self._tz)
+        self._vlog(f"list_heartbeats → {len(df)} 行")
+        return df
 
     def clear_strategy(self, strategy: str, human_confirm: bool = True) -> None:
         meta = self.get_meta(strategy)
@@ -581,17 +630,18 @@ class LocalManager(BaseManager):
                 return
 
         t0 = time.perf_counter()
+        c.execute("DELETE FROM heartbeats WHERE strategy = ?", [strategy])
         c.execute("DELETE FROM metas WHERE strategy = ?", [strategy])
         c.execute("DELETE FROM weights WHERE strategy = ?", [strategy])
         c.execute("DELETE FROM returns WHERE strategy = ?", [strategy])
         c.execute("DELETE FROM tags WHERE strategy = ?", [strategy])
         self._logger.info(
             f"策略 {strategy} 清空完成: weights={weights_count:,}, returns={returns_count:,}, "
-            f"tags={tags_count:,}, metas=1, 耗时 {time.perf_counter() - t0:.2f}s"
+            f"tags={tags_count:,}, heartbeats=1, metas=1, 耗时 {time.perf_counter() - t0:.2f}s"
         )
 
     def summary(self) -> dict:
-        # 一条 SQL 拿全部 5 个计数,与 OnlineManager.summary 保持对称
+        # 一条 SQL 拿全部 6 个计数,与 OnlineManager.summary 保持对称
         row = self.conn.execute(
             """
             SELECT
@@ -599,6 +649,7 @@ class LocalManager(BaseManager):
                 (SELECT count(*) FROM weights) AS weights,
                 (SELECT count(*) FROM returns) AS returns,
                 (SELECT count(*) FROM tags) AS tags,
+                (SELECT count(*) FROM heartbeats) AS heartbeats,
                 (SELECT count(DISTINCT strategy) FROM metas) AS strategies
             """
         ).fetchone()
@@ -609,7 +660,8 @@ class LocalManager(BaseManager):
             "weights": int(row[1]),
             "returns": int(row[2]),
             "tags": int(row[3]),
-            "strategies": int(row[4]),
+            "heartbeats": int(row[4]),
+            "strategies": int(row[5]),
         }
         self._vlog(f"summary → {result}")
         return result
