@@ -138,11 +138,13 @@ def test_publish_returns_triggers_heartbeat(local_mgr):
     before = local_mgr.get_heartbeat("S1")
     time.sleep(0.05)
 
-    df = pd.DataFrame({
-        "dt": pd.to_datetime(["2024-01-02", "2024-01-03"]),
-        "symbol": ["AAA", "AAA"],
-        "returns": [0.01, 0.02],
-    })
+    df = pd.DataFrame(
+        {
+            "dt": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+            "symbol": ["AAA", "AAA"],
+            "returns": [0.01, 0.02],
+        }
+    )
     local_mgr.publish_returns("S1", df)
     after = local_mgr.get_heartbeat("S1")
     assert after > before

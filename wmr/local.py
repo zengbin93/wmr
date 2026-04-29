@@ -588,9 +588,7 @@ class LocalManager(BaseManager):
         return ts
 
     def list_heartbeats(self) -> pd.DataFrame:
-        df = self.conn.execute(
-            "SELECT strategy, heartbeat_time FROM heartbeats ORDER BY heartbeat_time DESC"
-        ).df()
+        df = self.conn.execute("SELECT strategy, heartbeat_time FROM heartbeats ORDER BY heartbeat_time DESC").df()
         if not df.empty:
             df = _localize_dataframe_columns(df, ["heartbeat_time"], tz=self._tz)
         self._vlog(f"list_heartbeats → {len(df)} 行")

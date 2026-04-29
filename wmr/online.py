@@ -653,8 +653,7 @@ class OnlineManager(BaseManager):
 
     def get_heartbeat(self, strategy: str) -> pd.Timestamp | None:
         df = self.client.query_df(
-            f"SELECT heartbeat_time FROM {self._database}.heartbeats FINAL "
-            "WHERE strategy = %(strategy)s",
+            f"SELECT heartbeat_time FROM {self._database}.heartbeats FINAL WHERE strategy = %(strategy)s",
             parameters={"strategy": strategy},
         )
         if df.empty:
@@ -667,8 +666,7 @@ class OnlineManager(BaseManager):
 
     def list_heartbeats(self) -> pd.DataFrame:
         df = self.client.query_df(
-            f"SELECT strategy, heartbeat_time FROM {self._database}.heartbeats FINAL "
-            "ORDER BY heartbeat_time DESC"
+            f"SELECT strategy, heartbeat_time FROM {self._database}.heartbeats FINAL ORDER BY heartbeat_time DESC"
         )
         if not df.empty:
             df = _localize_dataframe_columns(df, ["heartbeat_time"], tz=self._tz)

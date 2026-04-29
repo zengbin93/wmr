@@ -106,17 +106,22 @@ def test_get_latest_weights_cs_shared_dt(local_mgr):
 def test_heartbeat_updates_strictly_increasing(local_mgr):
     """F6:publish_weights 完成后 heartbeat_time 严格递增,且仅在 end 调一次心跳。"""
     local_mgr.set_meta(
-        strategy="ts1", base_freq="日线", description="d", author="a",
+        strategy="ts1",
+        base_freq="日线",
+        description="d",
+        author="a",
         outsample_sdt="2024-01-01",
     )
     before = local_mgr.get_heartbeat("ts1")
     time.sleep(0.05)
 
-    df = pd.DataFrame({
-        "dt": pd.to_datetime(["2024-01-02", "2024-01-03"]),
-        "symbol": ["AAA", "AAA"],
-        "weight": [0.5, 0.6],
-    })
+    df = pd.DataFrame(
+        {
+            "dt": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+            "symbol": ["AAA", "AAA"],
+            "weight": [0.5, 0.6],
+        }
+    )
     local_mgr.publish_weights("ts1", df)
 
     after = local_mgr.get_heartbeat("ts1")

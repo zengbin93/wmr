@@ -105,7 +105,10 @@ def test_parity_tags(both_mgr):
 def test_parity_get_heartbeat(both_mgr):
     """get_heartbeat 双端返回类型一致(tz-aware Timestamp 或 None)。"""
     both_mgr.set_meta(
-        strategy="X", base_freq="日线", description="", author="a",
+        strategy="X",
+        base_freq="日线",
+        description="",
+        author="a",
         outsample_sdt="2024-01-01",
     )
     hb = both_mgr.get_heartbeat("X")
@@ -117,6 +120,7 @@ def test_parity_get_heartbeat(both_mgr):
 def test_parity_list_heartbeats_columns(both_mgr):
     """list_heartbeats 双端列名与排序一致。"""
     import time as _time
+
     both_mgr.set_meta(strategy="A", base_freq="d", description="", author="a", outsample_sdt="2024-01-01")
     _time.sleep(1.1)
     both_mgr.set_meta(strategy="B", base_freq="d", description="", author="a", outsample_sdt="2024-01-01")
@@ -137,7 +141,7 @@ def test_parity_summary_heartbeats_count_after_repeated_set_meta(both_mgr):
     Local 端走 PRIMARY KEY + INSERT OR REPLACE,Online 端走 ReplacingMergeTree + COUNT FINAL,
     路径不同但语义必须一致。
     """
-    base = dict(strategy="S1", base_freq="d", description="", author="a", outsample_sdt="2024-01-01")
+    base = {"strategy": "S1", "base_freq": "d", "description": "", "author": "a", "outsample_sdt": "2024-01-01"}
     both_mgr.set_meta(**base)
     both_mgr.set_meta(**{**base, "memo": "second"}, overwrite=True)
     both_mgr.set_meta(**{**base, "memo": "third"}, overwrite=True)
@@ -155,29 +159,38 @@ def test_parity_publish_pipeline_keeps_single_heartbeat_row(both_mgr):
     import time as _time
 
     both_mgr.set_meta(
-        strategy="P1", base_freq="日线", description="", author="a",
+        strategy="P1",
+        base_freq="日线",
+        description="",
+        author="a",
         outsample_sdt="2024-01-01",
     )
-    weights_df = pd.DataFrame({
-        "dt": pd.to_datetime(["2024-01-02", "2024-01-03"]),
-        "symbol": ["AAA", "AAA"],
-        "weight": [0.5, 0.6],
-    })
-    returns_df = pd.DataFrame({
-        "dt": pd.to_datetime(["2024-01-02", "2024-01-03"]),
-        "symbol": ["AAA", "AAA"],
-        "returns": [0.01, 0.02],
-    })
+    weights_df = pd.DataFrame(
+        {
+            "dt": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+            "symbol": ["AAA", "AAA"],
+            "weight": [0.5, 0.6],
+        }
+    )
+    returns_df = pd.DataFrame(
+        {
+            "dt": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+            "symbol": ["AAA", "AAA"],
+            "returns": [0.01, 0.02],
+        }
+    )
 
     both_mgr.publish_weights("P1", weights_df)
     _time.sleep(1.1)  # 适配 ClickHouse DateTime 秒级精度
     both_mgr.publish_returns("P1", returns_df)
     _time.sleep(1.1)
-    weights_df2 = pd.DataFrame({
-        "dt": pd.to_datetime(["2024-01-04"]),
-        "symbol": ["AAA"],
-        "weight": [0.7],
-    })
+    weights_df2 = pd.DataFrame(
+        {
+            "dt": pd.to_datetime(["2024-01-04"]),
+            "symbol": ["AAA"],
+            "weight": [0.7],
+        }
+    )
     both_mgr.publish_weights("P1", weights_df2)
 
     df = both_mgr.list_heartbeats()
