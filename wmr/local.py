@@ -545,6 +545,14 @@ class LocalManager(BaseManager):
         )
         self._vlog(f"heartbeat({strategy}) ok")
 
+    def get_heartbeat(self, strategy: str) -> pd.Timestamp | None:
+        # Task 2 替换为读 heartbeats 表的真实实现
+        return None
+
+    def list_heartbeats(self) -> pd.DataFrame:
+        # Task 2 替换为读 heartbeats 表的真实实现
+        return pd.DataFrame(columns=["strategy", "heartbeat_time"])
+
     def clear_strategy(self, strategy: str, human_confirm: bool = True) -> None:
         meta = self.get_meta(strategy)
         if not meta:

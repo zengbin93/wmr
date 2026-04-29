@@ -183,7 +183,7 @@ class BaseManager(ABC):
         """发布策略持仓权重(**仅追加** ``dt > latest_dt``)。
 
         对齐 ``cwc.publish_weights``:
-        1. 调用前后均触发 ``heartbeat``(每个 batch 之间也调用一次)
+        1. publish 完成后触发 ``heartbeat``(成功路径)
         2. 输入 DataFrame 须含 ``dt`` / ``symbol`` / ``weight`` 三列
         3. 按 ``get_latest_weights(strategy)`` 查询每个 symbol 的最新 dt,过滤 ``dt > latest_dt``
         4. 按 ``(symbol, dt, strategy)`` 去重后按 ``batch_size`` 分批写入
@@ -309,9 +309,29 @@ class BaseManager(ABC):
     # ---------- 心跳与运维 ----------
     @abstractmethod
     def heartbeat(self, strategy: str) -> None:
-        """更新 ``metas.heartbeat_time`` 为当前时间。
+        """记录策略心跳到 ``heartbeats`` 表(写入 / upsert 一行)。
 
         策略不存在时仅 warning,不抛异常(对齐 cwc 行为)。
+        """
+
+    @abstractmethod
+    def get_heartbeat(self, strategy: str) -> pd.Timestamp | None:
+        """获取指定策略的最新心跳时间。
+
+        Args:
+            strategy: 策略名。
+
+        Returns:
+            最新心跳时间(``Asia/Shanghai`` 时区);策略无心跳记录时返回 ``None``。
+        """
+
+    @abstractmethod
+    def list_heartbeats(self) -> pd.DataFrame:
+        """列出所有策略的最新心跳时间。
+
+        Returns:
+            DataFrame,列 ``strategy``、``heartbeat_time``;按 ``heartbeat_time`` 倒序排序。
+            无任何心跳记录时返回空 DataFrame。
         """
 
     @abstractmethod
