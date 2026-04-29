@@ -130,3 +130,19 @@ def test_summary_heartbeats_zero_initially(local_mgr):
     """空库 summary 的 heartbeats 字段为 0。"""
     s = local_mgr.summary()
     assert s["heartbeats"] == 0
+
+
+def test_publish_returns_triggers_heartbeat(local_mgr):
+    """publish_returns 完成后心跳更新(原本两端漏调,本次补齐)。"""
+    _seed_meta(local_mgr, "S1")
+    before = local_mgr.get_heartbeat("S1")
+    time.sleep(0.05)
+
+    df = pd.DataFrame({
+        "dt": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+        "symbol": ["AAA", "AAA"],
+        "returns": [0.01, 0.02],
+    })
+    local_mgr.publish_returns("S1", df)
+    after = local_mgr.get_heartbeat("S1")
+    assert after > before

@@ -427,7 +427,6 @@ class OnlineManager(BaseManager):
     def publish_weights(self, strategy: str, df: pd.DataFrame, batch_size: int = 100000) -> None:
         self._log_publish_entry(strategy, df, table="weights")
         t0 = time.perf_counter()
-        self.heartbeat(strategy)
         n = self._publish_dataframe(
             strategy,
             df,
@@ -517,6 +516,7 @@ class OnlineManager(BaseManager):
             mode="upsert",
             batch_size=batch_size,
         )
+        self.heartbeat(strategy)
         self._logger.info(
             f"完成 publish_returns(strategy={strategy}, 实际写入 {n} 条, 耗时 {time.perf_counter() - t0:.2f}s)"
         )

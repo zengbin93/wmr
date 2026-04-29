@@ -255,6 +255,8 @@ $ WMR_VERBOSE=1 python publish_demo.py
 [INFO] 完成 publish_weights(strategy=alpha_001, 实际写入 100000 条, 耗时 1.83s)
 ```
 
+> set_meta 与 publish_weights 完成后各触发一次 heartbeat ok(共 2 行,分别属于不同事件;publish 自身只在 end 调一次)。
+
 19 行 INFO,**用户能复现**:每张表 / 视图的创建顺序、心跳触发时机、过滤前后行数、批次进度、总耗时。
 
 ---
