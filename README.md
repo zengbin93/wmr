@@ -2,6 +2,9 @@
 
 策略持仓权重管理系统(ClickHouse & DuckDB 双后端)。
 
+> ⚠️ **0.2.0a1 是破坏性升级**:`heartbeat_time` 已从 `metas` 表拆到独立 `heartbeats` 表,
+> 不支持就地升级。详见 [CHANGELOG.md](CHANGELOG.md#020a1--2026-04-29--心跳拆表破坏性变更)。
+
 ## 核心特性
 
 - **双后端**:`LocalManager`(DuckDB,本地/单机/CI)与 `OnlineManager`(ClickHouse,生产)语义等价。
