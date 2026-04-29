@@ -100,3 +100,85 @@ def test_parity_tags(both_mgr):
     both_mgr.add_tag("a", "y")
     df = both_mgr.list_tags("a")
     assert set(df["tag"]) == {"x", "y"}
+
+
+def test_parity_get_heartbeat(both_mgr):
+    """get_heartbeat 双端返回类型一致(tz-aware Timestamp 或 None)。"""
+    both_mgr.set_meta(
+        strategy="X", base_freq="日线", description="", author="a",
+        outsample_sdt="2024-01-01",
+    )
+    hb = both_mgr.get_heartbeat("X")
+    assert hb is not None
+    assert hasattr(hb, "tzinfo") and hb.tzinfo is not None
+    assert both_mgr.get_heartbeat("ghost") is None
+
+
+def test_parity_list_heartbeats_columns(both_mgr):
+    """list_heartbeats 双端列名与排序一致。"""
+    import time as _time
+    both_mgr.set_meta(strategy="A", base_freq="d", description="", author="a", outsample_sdt="2024-01-01")
+    _time.sleep(1.1)
+    both_mgr.set_meta(strategy="B", base_freq="d", description="", author="a", outsample_sdt="2024-01-01")
+    df = both_mgr.list_heartbeats()
+    assert list(df.columns) == ["strategy", "heartbeat_time"]
+    assert list(df["strategy"]) == ["B", "A"]
+
+
+def test_parity_summary_keys(both_mgr):
+    """summary 双端字典 key 集合一致(含 heartbeats)。"""
+    s = both_mgr.summary()
+    assert set(s.keys()) == {"metas", "weights", "returns", "tags", "heartbeats", "strategies"}
+
+
+def test_parity_summary_heartbeats_count_after_repeated_set_meta(both_mgr):
+    """N 次 set_meta(同一 strategy)后 summary heartbeats == 1(锁 UPSERT 语义跨 DDL 引擎)。
+
+    Local 端走 PRIMARY KEY + INSERT OR REPLACE,Online 端走 ReplacingMergeTree + COUNT FINAL,
+    路径不同但语义必须一致。
+    """
+    base = dict(strategy="S1", base_freq="d", description="", author="a", outsample_sdt="2024-01-01")
+    both_mgr.set_meta(**base)
+    both_mgr.set_meta(**{**base, "memo": "second"}, overwrite=True)
+    both_mgr.set_meta(**{**base, "memo": "third"}, overwrite=True)
+    s = both_mgr.summary()
+    assert s["heartbeats"] == 1
+
+
+def test_parity_publish_pipeline_keeps_single_heartbeat_row(both_mgr):
+    """完整 publish 流水线后 list_heartbeats 仍只有该 strategy 1 行。
+
+    set_meta -> publish_weights -> publish_returns -> publish_weights 共触发 4 次心跳
+    (set_meta 1 次 + publish_weights/returns 各 1 次,共 2 次 publish_weights),
+    UPSERT 语义保证 list_heartbeats 该 strategy 只 1 行,且 heartbeat_time 是最后一次。
+    """
+    import time as _time
+
+    both_mgr.set_meta(
+        strategy="P1", base_freq="日线", description="", author="a",
+        outsample_sdt="2024-01-01",
+    )
+    weights_df = pd.DataFrame({
+        "dt": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+        "symbol": ["AAA", "AAA"],
+        "weight": [0.5, 0.6],
+    })
+    returns_df = pd.DataFrame({
+        "dt": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+        "symbol": ["AAA", "AAA"],
+        "returns": [0.01, 0.02],
+    })
+
+    both_mgr.publish_weights("P1", weights_df)
+    _time.sleep(1.1)  # 适配 ClickHouse DateTime 秒级精度
+    both_mgr.publish_returns("P1", returns_df)
+    _time.sleep(1.1)
+    weights_df2 = pd.DataFrame({
+        "dt": pd.to_datetime(["2024-01-04"]),
+        "symbol": ["AAA"],
+        "weight": [0.7],
+    })
+    both_mgr.publish_weights("P1", weights_df2)
+
+    df = both_mgr.list_heartbeats()
+    assert (df["strategy"] == "P1").sum() == 1
